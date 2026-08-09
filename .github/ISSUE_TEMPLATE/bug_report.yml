@@ -1,0 +1,21 @@
+name: Bug report
+description: 报告显示器兼容性或可复现问题
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: textarea
+    attributes:
+      label: 问题描述
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: 环境
+      description: Windows 版本、显示器型号、连接方式、DDC/CI 状态
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: 复现步骤与恢复结果
+    validations:
+      required: true
