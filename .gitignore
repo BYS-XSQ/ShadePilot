@@ -1,4 +1,5 @@
 bin/
+artifacts/
 obj/
 .vs/
 *.user
