@@ -2,7 +2,7 @@
 
 ShadePilot 是一款轻量的 Windows 显示体验调节工具。它把显示器硬件控制、画面风格和恢复操作集中到一个克制的桌面界面中，在达到明确功能目标后不继续堆叠无关能力。
 
-> 当前版本：`0.1.0`（公开测试版）
+> 当前版本：`BETA 0.1.5`（公开测试版）
 > 平台：Windows 10/11
 
 ## 主要功能
@@ -17,7 +17,7 @@ ShadePilot 不查找或读取游戏进程，不注入 DLL、不创建游戏覆�
 
 ## 安装与运行
 
-1. 从 [Releases](https://github.com/BYS-XSQ/ShadePilot/releases) 下载 `ShadePilot-0.1.0-win-x64.zip`。
+1. 从 [Releases](https://github.com/BYS-XSQ/ShadePilot/releases) 下载 `ShadePilot-BETA-0.1.5-win-x64.zip`。
 2. 完整解压后运行 `ShadePilot.exe`。
 3. 如果未检测到显示器能力，请先在显示器菜单中启用 DDC/CI。
 
@@ -60,3 +60,4 @@ Bug 报告请附上 ShadePilot 版本、Windows 版本、显示器型号、连�
 ## 许可证
 
 源代码采用 [MIT License](LICENSE)。ShadePilot 名称、Logo、图标和品牌视觉素材不包含在 MIT 授权中，未经许可不得用于暗示官方版本或合作关系。
+
