@@ -9,19 +9,19 @@ ShadePilot 是一款轻量的 Windows 显示体验调节工具。它把显示器
 
 ### 暗部提亮与高光压制
 
-![ShadePilot 暗部提亮与高光压制效果对比](docs/images/before-after-simulation.jpg)
+<img src="docs/images/before-after-simulation.png" width="100%" alt="ShadePilot 暗部提亮与高光压制效果对比">
 
 左上为原始画面，右下为 ShadePilot 极限参数的离线效果模拟。实际观感会受到显示器、HDR 状态、系统色彩设置和面板特性的影响。
 
 ### 主界面总览
 
-![ShadePilot 主界面](docs/images/main-overview.jpg)
+<img src="docs/images/main-overview.png" width="719" alt="ShadePilot 主界面">
 
 显示器硬件参数与画面风格集中在同一界面，可调节亮度、对比度、软件饱和度、暗部、高光、中间调、黑白位、色温和自然色彩等项目。
 
 ### 工具中心与自动切换
 
-![ShadePilot 工具中心](docs/images/tools-center.jpg)
+<img src="docs/images/tools-center.png" width="760" alt="ShadePilot 工具中心">
 
 工具中心包含按住查看原画、A/B 临时对比、前台游戏自动切换、预设分享代码和环境诊断。预设快捷键及多预设循环快捷键可在独立快捷键面板中配置，并可在后台使用。
 
