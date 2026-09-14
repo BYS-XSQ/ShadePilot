@@ -2,5 +2,10 @@ bin/
 artifacts/
 obj/
 .vs/
+bin-wpf*/
+dist/
+DriverEnhancement/**/build/
+DriverEnhancement/**/test-results/
+DriverEnhancement/Intel/igcl-upstream/
 *.user
 *.suo

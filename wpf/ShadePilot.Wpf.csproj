@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType><TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF><UseWindowsForms>true</UseWindowsForms><EnableWindowsTargeting>true</EnableWindowsTargeting>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <StartupObject>ShadePilotWpf.App</StartupObject><GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <ApplicationIcon>..\assets\shadepilot-icon.ico</ApplicationIcon><ApplicationManifest>..\app.manifest</ApplicationManifest><AssemblyName>ShadePilot.Wpf</AssemblyName><RootNamespace>ShadePilotWpf</RootNamespace><Version>0.4.5</Version><AssemblyVersion>0.4.5.0</AssemblyVersion><FileVersion>0.4.5.0</FileVersion>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\DriverEnhancement\Managed\ShadePilot.DriverEnhancement.csproj" />
+    <Compile Remove="MainWindow.xaml.cs" />
+    <Compile Include="..\DisplayPreset.cs" Link="Legacy\DisplayPreset.cs" />
+    <Compile Include="..\SimpleAdjustmentMapper.cs" Link="Legacy\SimpleAdjustmentMapper.cs" />
+    <None Include="..\assets\shadepilot-icon.ico" Link="assets\shadepilot-icon.ico" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="..\assets\shadepilot-logo-256.png" Link="assets\shadepilot-logo-256.png" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

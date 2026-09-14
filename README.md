@@ -1,62 +1,102 @@
 # ShadePilot
 
-ShadePilot 是一款轻量的 Windows 显示体验调节工具。它把显示器硬件控制、画面风格和恢复操作集中到一个克制的桌面界面中，在达到明确功能目标后不继续堆叠无关能力。
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-> 当前版本：`0.1.0`（公开测试版）
-> 平台：Windows 10/11
+ShadePilot is a lightweight Windows display and color-control utility. It brings monitor hardware controls, software picture styles, presets, and safe recovery into one desktop application without injecting into games or creating an in-game overlay.
 
-## 主要功能
+> Current version: \`BETA 0.4.5\`
+> Platform: Windows 10/11
 
-- 枚举物理显示器，并检测亮度、对比度、色温及部分 DDC/CI 能力。
-- 通过标准 Windows `Dxva2.dll` 接口调节支持的显示器。
-- 提供有限的画面风格、Gamma 调节和自定义预设。
-- 支持全局快捷键、系统托盘与按显示器保存的本地设置。
-- 记录程序启动时的显示状态，可手动恢复，并默认在正常退出时恢复。
+## Screenshots and overview
 
-ShadePilot 不查找或读取游戏进程，不注入 DLL、不创建游戏覆盖层、不截图、不模拟输入，也不联网。它只调用 Windows 显示器配置 API。
+### Shadow lift and highlight control
 
-## 安装与运行
+<img src="docs/images/before-after-simulation.png" width="100%" alt="ShadePilot shadow lift and highlight control">
 
-1. 从 [Releases](https://github.com/BYS-XSQ/ShadePilot/releases) 下载 `ShadePilot-0.1.0-win-x64.zip`。
-2. 完整解压后运行 `ShadePilot.exe`。
-3. 如果未检测到显示器能力，请先在显示器菜单中启用 DDC/CI。
+The image is an offline simulation of ShadePilot's style controls. Actual results depend on the monitor, HDR state, Windows color settings, and panel characteristics.
 
-常规运行不需要管理员权限。测试版目前未进行商业代码签名，Windows 可能提示未知发布者；请只从本仓库 Release 下载并核对 SHA-256，不要永久关闭安全软件。
+### Main display controls
 
-## 安全与恢复
+<img src="docs/images/main-overview.png" width="719" alt="ShadePilot main display controls">
 
-- 应用启动时记录可读取的显示器参数和原始 Gamma 状态。
-- “重置参数”和“重置风格”可分别恢复硬件参数与画面曲线。
-- “退出时自动恢复”默认开启，正常关闭主窗口时执行恢复。
-- 断电、系统崩溃或强制结束进程时，退出恢复无法保证执行；遇到显示异常时可重新运行 ShadePilot 并恢复，或使用显示器实体菜单恢复默认值。
+Hardware brightness and contrast, software saturation, picture styles, tone controls, presets, and recovery actions are available from the same application.
 
-## 兼容性与已知限制
+### Tools center and game switching
 
-- 外接显示器需要支持并启用 DDC/CI；内置屏幕、扩展坞、KVM 和部分转接器可能不支持。
-- 不同厂商对 MCCS/VCP 指令的实现不一致，某些控件可能不可用或写入后不回报状态。
-- Gamma 调节作用于整个 SDR 桌面，在 HDR 模式下可能无效或表现不同。
-- 软件不会自动判断某套参数是否适合特定显示器，请小幅调节并保留恢复选项。
+<img src="docs/images/tools-center.png" width="760" alt="ShadePilot tools center">
 
-## 隐私
+The Tools Center provides original-image toggle, A/B comparison, foreground-game switching, preset sharing, environment diagnostics, and background hotkeys.
 
-ShadePilot 不联网，不包含账号、遥测或广告 SDK。设置保存在 `%LOCALAPPDATA%\DisplayPresetPrototype\`，卸载时可以手动删除该目录。
+### Preset share code
 
-## 从源码构建
+![ShadePilot preset share code](docs/images/preset-share-code.png)
 
-```powershell
-.\build.ps1
-```
+Export or import a complete picture preset as a single share code.
 
-脚本使用 Windows 自带的 .NET Framework C# 编译器，不下载第三方依赖，输出为 `bin\ShadePilot.exe`。
+## Key features
 
-## 反馈
+- Enumerates physical displays and detects supported brightness, contrast, color, and DDC/CI capabilities.
+- Uses standard Windows \`Dxva2.dll\` APIs for supported monitor controls.
+- Provides live tone curves, picture styles, custom presets, and a simple adjustment mode for brightness, dark areas, clarity, tonal depth, color, and temperature.
+- Exports a standard 33-point \`.cube\` 3D LUT for the OBS Apply LUT filter.
+- Includes a game performance protection mode that pauses Windows software color transforms and display re-detection while a foreground fullscreen application is running.
+- Restores missing built-in presets without overwriting user presets.
+- Supports global hotkeys, the system tray, per-display settings, and multi-display style synchronization.
+- Records the display state at session start and restores it on normal exit or after a dirty session is detected.
 
-Bug 报告请附上 ShadePilot 版本、Windows 版本、显示器型号、连接方式、DDC/CI 状态、复现步骤和错误提示。
+ShadePilot does not inspect game processes, inject DLLs, create game overlays, capture the screen, simulate input, or connect to the network. It uses Windows display configuration APIs.
 
-- [报告问题](https://github.com/BYS-XSQ/ShadePilot/issues)
-- [贡献指南](CONTRIBUTING.md)
-- [安全问题报告](SECURITY.md)
+## Install and run
 
-## 许可证
+1. Download \`ShadePilot-BETA-0.4.5-win-x64.zip\` from [Releases](https://github.com/BYS-XSQ/ShadePilot/releases).
+2. Extract the archive and run \`ShadePilot.Wpf.exe\`.
+3. If monitor capabilities are not detected, enable DDC/CI in the monitor's on-screen menu.
 
-源代码采用 [MIT License](LICENSE)。ShadePilot 名称、Logo、图标和品牌视觉素材不包含在 MIT 授权中，未经许可不得用于暗示官方版本或合作关系。
+The package is framework-dependent and requires the .NET 8 Windows Desktop Runtime. The test build is not commercially code-signed, so Windows may show an unknown-publisher warning. Download releases only from this repository and verify the SHA-256 hash when distributing a build.
+
+### Use a LUT in OBS
+
+1. In ShadePilot, choose **Export LUT** in the picture-style toolbar.
+2. In OBS, add the **Apply LUT** filter to the game capture source or scene.
+3. Select the exported \`.cube\` file and set the filter strength to 100%.
+
+The LUT contains picture-style curves, exposure, temperature, tint, and saturation intent. Monitor backlight and hardware contrast cannot be reproduced by an OBS post-process LUT and are therefore not written into the file. Use it as part of an SDR workflow.
+
+## Safety and recovery
+
+- The application records readable monitor parameters and the original Gamma state at session start.
+- **Reset parameters** and **Reset style** restore hardware controls and picture curves independently.
+- **Restore on exit** is enabled by default for a normal window close.
+- Power loss, system crashes, and forced termination may prevent an immediate shutdown restore. On the next launch, ShadePilot uses its persistent recovery state to restore the previous session baseline when possible.
+
+## Compatibility and known limitations
+
+- External monitors must support and have DDC/CI enabled; built-in panels, docks, KVMs, and adapters may not expose these controls.
+- MCCS/VCP behavior differs between vendors. Some controls may be unavailable or may not report a reliable read-back value.
+- Gamma adjustment affects the SDR desktop and may be ineffective or behave differently in HDR mode.
+- ShadePilot does not automatically determine whether a preset is suitable for a particular monitor. Adjust gradually and keep the recovery options available.
+- Driver-level sharpening/IGCL write support is not included in this release.
+
+## Privacy
+
+ShadePilot does not connect to the network and contains no accounts, telemetry, or advertising SDKs. Settings are stored under \`%LOCALAPPDATA%\\DisplayPresetPrototype\\\`.
+
+## Build from source
+
+\`\`\`powershell
+dotnet publish .\wpf\ShadePilot.Wpf.csproj -c Release -r win-x64 --self-contained false
+\`\`\`
+
+The legacy \`build.ps1\` script still builds the classic WinForms target. The current desktop release is the WPF target under \`wpf\\\`.
+
+## Feedback
+
+When reporting a bug, include the ShadePilot version, Windows version, monitor model, connection path, DDC/CI status, reproduction steps, and the exact error message.
+
+- [Report an issue](https://github.com/BYS-XSQ/ShadePilot/issues)
+- [Contributing guide](CONTRIBUTING.md)
+- [Security policy](SECURITY.md)
+
+## License
+
+The source code is available under the [MIT License](LICENSE). The ShadePilot name, logo, and brand assets are not included in the MIT license and may not be used to imply an official build or partnership without permission.

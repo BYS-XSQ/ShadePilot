@@ -2,7 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
+using System.Diagnostics;
 using System.IO;
+using System.Globalization;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
@@ -11,6 +14,12 @@ using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 using Microsoft.Win32;
+
+[assembly: System.Reflection.AssemblyTitle("ShadePilot BETA 0.4.5")]
+[assembly: System.Reflection.AssemblyProduct("ShadePilot")]
+[assembly: System.Reflection.AssemblyDescription("ShadePilot display and color control beta")]
+[assembly: System.Reflection.AssemblyVersion("0.4.5.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.4.5.0")]
 
 namespace DisplayPresetPrototype
 {
@@ -48,6 +57,8 @@ namespace DisplayPresetPrototype
         private readonly TrackBar brightness = NewSlider();
         private readonly TrackBar contrast = NewSlider();
         private readonly TrackBar saturation = NewSlider();
+        private readonly Label saturationTitle = NewLabel("饱和度", 42, 308);
+        private readonly ComboBox saturationBackend = new ThemedComboBox();
         private readonly Label brightnessValue = new Label();
         private readonly Label contrastValue = new Label();
         private readonly Label saturationValue = new Label();
@@ -55,8 +66,11 @@ namespace DisplayPresetPrototype
         private readonly Label status = new Label();
         private readonly CheckBox restoreOnExit = new CheckBox();
         private readonly CheckBox liveApply = new CheckBox();
+        private readonly CheckBox syncAllDisplays = new CheckBox();
         private readonly System.Windows.Forms.Timer liveApplyTimer = new System.Windows.Forms.Timer();
         private readonly GammaRampController gammaController = new GammaRampController();
+        private readonly FullscreenColorController softwareSaturation =
+            new FullscreenColorController();
         private readonly StyleSettingsStore styleStore = StyleSettingsStore.Load();
         private readonly AppSettingsStore appSettings = AppSettingsStore.Load();
         private readonly TrackBar styleShadows = NewStyleSlider(0, 200);
@@ -89,12 +103,15 @@ namespace DisplayPresetPrototype
         private readonly ComboBox strengthBox = new ThemedComboBox();
         private readonly ComboBox themeBox = new ThemedComboBox();
         private readonly Label styleRiskStatus = new Label();
+        private readonly ToneCurveGraph liveToneCurve = new ToneCurveGraph();
         private readonly System.Windows.Forms.Timer stylePreviewTimer = new System.Windows.Forms.Timer();
         private readonly NotifyIcon trayIcon = new NotifyIcon();
         private readonly ToolStripMenuItem trayStyleStatus = new ToolStripMenuItem();
         private readonly ToolStripMenuItem trayMonitorStatus = new ToolStripMenuItem();
         private readonly ToolStripMenuItem trayHotkeyStatus = new ToolStripMenuItem();
         private readonly System.Windows.Forms.Timer recoveryTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer gameRuleTimer = new System.Windows.Forms.Timer();
+        private readonly System.Windows.Forms.Timer resizeUiTimer = new System.Windows.Forms.Timer();
         private readonly ToolTip helpTip = new ToolTip();
         private readonly Dictionary<int, StylePresetData> hotkeyMap = new Dictionary<int, StylePresetData>();
         private readonly Dictionary<string, string> hotkeyRegistrationStatus = new Dictionary<string, string>();
@@ -112,24 +129,76 @@ namespace DisplayPresetPrototype
         private bool hotkeysRegistered;
         private bool trayHintShown;
         private bool settingStyleControls;
+        private bool usingSoftwareSaturation;
         private StylePresetData activeStyle;
+        private int cyclePresetIndex = -1;
         private int registeredHotkeyCount;
+        private StylePresetData temporaryA;
+        private StylePresetData temporaryB;
+        private string lastAutoProcess;
+        private StylePresetData styleBeforeAutoSwitch;
+        private bool autoSwitchActive;
+        private bool softwareSaturationSuppressedForGame;
+        private StylePresetData styleBeforeOriginalToggle;
+        private bool originalToggleActive;
+        private bool displayRefreshRunning;
+        private bool displayRefreshPending;
+        private bool rebuildingDisplayList;
+        private bool reapplyStyleAfterRefresh;
+        private bool performanceProtectionActive;
+        private bool displayRecoveryDeferredForGame;
+        private int hotkeyReceivedCount;
+        private DateTime lastHotkeyReceivedUtc;
+        private string lastHotkeyAction = "尚未收到";
+        private string lastStyleApplyError = "无";
+        private readonly int currentProcessId;
 
         private const int WmHotkey = 0x0312;
         private const int HotkeyStyleBase = 2100;
         private const int HotkeyRestore = 2199;
+        private const int HotkeyCycle = 2198;
+        private const int HotkeyOriginalToggle = 2197;
+        private const int WmNcHitTest = 0x0084;
+        private const int WmNcLButtonDown = 0x00A1;
+        private const int HtCaption = 0x0002;
+
+        [DllImport("user32.dll")]
+        private static extern bool ReleaseCapture();
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("dwmapi.dll")]
+        private static extern int DwmSetWindowAttribute(
+            IntPtr hwnd, int attribute, ref int value, int valueSize);
 
         public MainForm()
         {
-            Text = "ShadePilot";
-            ClientSize = new Size(700, 760);
-            MinimumSize = new Size(700, 640);
+            using (var currentProcess = Process.GetCurrentProcess())
+                currentProcessId = currentProcess.Id;
+            Text = "ShadePilot BETA 0.4.5";
+            ClientSize = new Size(1180, 840);
+            MinimumSize = new Size(1000, 700);
             StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.None;
+            Padding = new Padding(1);
             Font = new Font("Microsoft YaHei UI", 9F);
             BackColor = Canvas;
+            // All coordinates below are authored at 96 DPI.  Without an
+            // explicit design baseline WinForms can infer it from the machine
+            // that first creates the form, then scale fonts and controls by
+            // different factors on 125%-200% displays.
+            AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
-            AutoScroll = true;
-            AutoScrollMinSize = new Size(0, 1216);
+            // The adaptive page below is the single scroll owner. Enabling
+            // Form.AutoScroll as well creates nested vertical scrollbars and
+            // makes each wheel step move only the inner viewport.
+            AutoScroll = false;
+            AutoScrollMinSize = Size.Empty;
+            SetStyle(ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer |
+                     ControlStyles.ResizeRedraw, true);
+            DoubleBuffered = true;
             try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
             var logo = new PictureBox {
                 Location = new Point(28, 17), Size = new Size(42, 42),
@@ -143,15 +212,32 @@ namespace DisplayPresetPrototype
                 Text = "ShadePilot",
                 ForeColor = Ink,
                 Font = new Font(Font.FontFamily, 19F, FontStyle.Bold),
-                AutoSize = true, Location = new Point(80, 18)
+                AutoSize = false, Location = new Point(80, 14),
+                Size = new Size(325, 42), TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true
             };
             var safety = new Label {
                 Text = "明暗与色彩控制台",
-                ForeColor = Muted,
-                AutoSize = true, Location = new Point(83, 57)
+                ForeColor = Ink,
+                AutoSize = false, Location = new Point(83, 55),
+                Size = new Size(322, 24), TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Font = new Font("Microsoft YaHei UI", 8.5F, FontStyle.Regular)
             };
+            var brandEnglish = new Label {
+                Text = "DISPLAY INTELLIGENCE · COLOR CONTROL",
+                ForeColor = Muted,
+                AutoSize = false, Location = new Point(83, 72),
+                Size = new Size(322, 18), TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
+                Font = new Font("Segoe UI", 7.5F, FontStyle.Regular)
+            };
+            title.Tag = "CanvasText";
+            safety.Tag = "CanvasText";
+            brandEnglish.Tag = "CanvasMuted";
             var themeLabel = new Label {
-                Text = "界面主题", AutoSize = true, Location = new Point(540, 17),
+                Text = "界面主题", AutoSize = false, Location = new Point(540, 14),
+                Size = new Size(130, 24), TextAlign = ContentAlignment.MiddleLeft,
                 ForeColor = Muted, BackColor = Canvas,
                 Font = new Font("Microsoft YaHei UI", 8F)
             };
@@ -166,7 +252,9 @@ namespace DisplayPresetPrototype
             monitorBox.BackColor = Color.White;
             monitorBox.Location = new Point(42, 118);
             monitorBox.Size = new Size(400, 28);
-            monitorBox.SelectedIndexChanged += delegate { LoadSelectedMonitor(); };
+            monitorBox.SelectedIndexChanged += delegate {
+                if (!rebuildingDisplayList) LoadSelectedMonitor(false);
+            };
             var refresh = NewButton("重新检测", 454, 115, 92);
             refresh.Click += delegate { RefreshDisplays(); };
 
@@ -189,21 +277,50 @@ namespace DisplayPresetPrototype
             contrast.MouseUp += delegate { FlushLiveApply(); };
             saturation.MouseUp += delegate { FlushLiveApply(); };
 
+            saturationBackend.DropDownStyle = ComboBoxStyle.DropDownList;
+            saturationBackend.FlatStyle = FlatStyle.Flat;
+            saturationTitle.Size = new Size(72, 22);
+            saturationBackend.Location = new Point(122, 306);
+            saturationBackend.Size = new Size(210, 28);
+            saturationBackend.Items.AddRange(new object[] {
+                "自动选择", "显示器 DDC/CI", "Windows 软件色彩"
+            });
+            saturationBackend.SelectedIndex = Math.Max(0,
+                Math.Min(2, appSettings.SaturationBackend));
+            saturationBackend.SelectedIndexChanged += delegate {
+                appSettings.SaturationBackend = saturationBackend.SelectedIndex;
+                appSettings.Save();
+                LoadSelectedMonitor(false);
+            };
+
             saturationHint.Text = "当前显示器不支持硬件饱和度";
-            saturationHint.AutoSize = true;
-            saturationHint.Location = new Point(255, 337);
+            saturationHint.AutoSize = false;
+            saturationHint.Location = new Point(42, 337);
+            saturationHint.Size = new Size(608, 24);
+            saturationHint.TextAlign = ContentAlignment.MiddleLeft;
+            saturationHint.AutoEllipsis = true;
             saturationHint.ForeColor = Muted;
             saturationHint.BackColor = Color.White;
             saturationHint.Visible = false;
+            saturationHint.Margin = new Padding(4, -2, 4, 6);
 
             liveApply.Text = "拖动时实时应用";
             liveApply.Checked = true;
-            liveApply.AutoSize = true;
+            liveApply.AutoSize = false;
+            liveApply.Size = new Size(240, 30);
             liveApply.ForeColor = Muted;
             liveApply.BackColor = Color.White;
             liveApply.Location = new Point(42, 405);
             liveApply.CheckedChanged += delegate {
                 if (!liveApply.Checked) liveApplyTimer.Stop();
+            };
+            syncAllDisplays.Text = "同步所有显示器画面风格";
+            syncAllDisplays.Checked = appSettings.SyncAllDisplays;
+            syncAllDisplays.AutoSize = true;
+            syncAllDisplays.ForeColor = Muted;
+            syncAllDisplays.CheckedChanged += delegate {
+                appSettings.SyncAllDisplays = syncAllDisplays.Checked;
+                appSettings.Save();
             };
 
             liveApplyTimer.Interval = 180;
@@ -222,7 +339,8 @@ namespace DisplayPresetPrototype
             restore.Click += delegate { RestoreStartup(); };
             restoreOnExit.Text = "退出时自动恢复";
             restoreOnExit.Checked = true;
-            restoreOnExit.AutoSize = true;
+            restoreOnExit.AutoSize = false;
+            restoreOnExit.Size = new Size(260, 30);
             restoreOnExit.ForeColor = Muted;
             restoreOnExit.BackColor = Color.FromArgb(249, 250, 253);
             restoreOnExit.Location = new Point(42, 1028);
@@ -232,16 +350,9 @@ namespace DisplayPresetPrototype
             restoreStyle.BackColor = Color.FromArgb(240, 237, 255);
             restoreStyle.ForeColor = Accent;
             restoreStyle.Click += delegate { RestoreStyle(); };
-            var curvePreview = NewButton("曲线预览", 435, 459, 100);
-            curvePreview.SurfaceColor = Color.FromArgb(249, 248, 255);
-            curvePreview.Click += delegate {
-                using (var dialog = new CurvePreviewForm(
-                    styleShadows.Value, styleHighlights.Value, styleMidtones.Value,
-                    styleBlackPoint.Value, styleWhitePoint.Value, styleContrastPivot.Value,
-                    styleVibrance.Value, styleExposure.Value, styleShadowRange.Value,
-                    styleHighlightRange.Value, styleTransitionSoftness.Value))
-                    dialog.ShowDialog(this);
-            };
+            var exportLut = NewButton("导出 OBS LUT", 435, 459, 112);
+            exportLut.SurfaceColor = Color.FromArgb(249, 248, 255);
+            exportLut.Click += delegate { ExportCurrentLut(); };
             var optimizeStyle = NewButton("一键优化", 545, 899, 105);
             optimizeStyle.SurfaceColor = ThemeManager.Current.TintSurface;
             optimizeStyle.BackColor = Color.FromArgb(240, 237, 255);
@@ -315,6 +426,10 @@ namespace DisplayPresetPrototype
             var configureHotkeys = NewButton("快捷键", 556, 516, 94);
             configureHotkeys.SurfaceColor = Color.FromArgb(249, 248, 255);
             configureHotkeys.Click += delegate { ConfigureHotkeys(); };
+            var toolsCenter = NewButton("工具中心", 420, 37, 105);
+            toolsCenter.SurfaceColor = Canvas;
+            toolsCenter.BackColor = Accent;
+            toolsCenter.ForeColor = Color.White;
 
             ConfigureGridSlider(styleShadows, 42, 586);
             ConfigureGridSlider(styleHighlights, 250, 586);
@@ -358,43 +473,276 @@ namespace DisplayPresetPrototype
             stylePreviewTimer.Interval = 120;
             stylePreviewTimer.Tick += delegate { stylePreviewTimer.Stop(); ApplyStylePreview(); };
 
-            Controls.AddRange(new Control[] {
-                title, safety,
-                logo,
-                themeLabel, themeBox,
-                mainCard, styleCard, actionCard,
-                NewLabel("显示器", 42, 98), monitorBox, refresh,
-                NewLabel("亮度", 42, 164), brightness, brightnessValue,
-                NewLabel("对比度", 42, 236), contrast, contrastValue,
-                NewLabel("硬件饱和度", 42, 308), saturation, saturationValue, saturationHint,
-                liveApply, apply,
-                NewTintedSectionTitle("画面风格", 42, 463),
-                NewTintedMutedLabel("选择预设，或直接拖动参数微调", 42, 490),
-                NewTintedLabel("强度档位", 230, 465), strengthBox,
-                stylePresetBox, applyStyle, saveStyle, manageStyles, configureHotkeys,
-                NewTintedLabel("提亮暗部", 42, 561), styleShadows, styleShadowValue,
-                NewTintedLabel("压低高光", 250, 561), styleHighlights, styleHighlightValue,
-                NewTintedLabel("中间调", 458, 561), styleMidtones, styleMidtoneValue,
-                NewTintedLabel("黑位", 42, 627), styleBlackPoint, styleBlackPointValue,
-                NewTintedLabel("白位", 250, 627), styleWhitePoint, styleWhitePointValue,
-                NewTintedLabel("中间对比", 458, 627), styleContrastPivot, styleContrastPivotValue,
-                NewTintedLabel("色温", 42, 693), styleTemperature, styleTemperatureValue,
-                NewTintedLabel("色调", 250, 693), styleTint, styleTintValue,
-                NewTintedLabel("自然色彩", 458, 693), styleVibrance, styleVibranceValue,
-                NewTintedLabel("整体曝光", 42, 759), styleExposure, styleExposureValue,
-                NewTintedLabel("暗部范围", 356, 759), styleShadowRange, styleShadowRangeValue,
-                NewTintedLabel("高光范围", 42, 825), styleHighlightRange, styleHighlightRangeValue,
-                NewTintedLabel("过渡柔和", 356, 825), styleTransitionSoftness, styleTransitionSoftnessValue,
-                styleRiskStatus, optimizeStyle,
-                restore, restoreOnExit, curvePreview, restoreStyle,
-                NewSoftMutedLabel("后台快捷键可自由分配；最小化后仍可切换画面风格", 42, 1064),
-                status, authorFooter, sharingFooter
-            });
-            // Put each decorative panel behind its controls, then place the
-            // unified white surface behind all nested panels.
-            styleCard.SendToBack();
-            actionCard.SendToBack();
-            mainCard.SendToBack();
+            // Adaptive layout: rows are sized from their content instead of
+            // sharing fixed Y coordinates. This prevents text/slider overlap
+            // at fractional DPI and allows the usable width to grow naturally.
+            var page = NewAdaptivePage();
+            page.Tag = "CanvasContainer";
+            var brand = NewAdaptiveFlow(FlowDirection.TopDown);
+            brand.Controls.Add(title); brand.Controls.Add(safety); brand.Controls.Add(brandEnglish);
+            title.AutoSize = true; safety.AutoSize = true; brandEnglish.AutoSize = true;
+            var themeArea = NewAdaptiveFlow(FlowDirection.TopDown);
+            themeLabel.AutoSize = true; themeBox.Width = 130;
+            themeArea.Controls.Add(themeLabel); themeArea.Controls.Add(themeBox);
+
+            var hardwareCard = NewAdaptiveCard(Card);
+            hardwareCard.Tag = "SurfaceContainer";
+            var monitorRow = NewAdaptiveGrid(4, 38);
+            monitorRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            monitorRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            monitorRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            monitorRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            monitorRow.Controls.Add(NewAdaptiveText("显示器", true), 0, 0);
+            monitorBox.Dock = DockStyle.Fill;
+            monitorRow.Controls.Add(monitorBox, 1, 0);
+            monitorRow.Controls.Add(refresh, 2, 0); monitorRow.Controls.Add(restore, 3, 0);
+            hardwareCard.Controls.Add(monitorRow);
+            hardwareCard.Controls.Add(NewAdaptiveSliderRow("亮度", null, brightness, brightnessValue));
+            hardwareCard.Controls.Add(NewAdaptiveSliderRow("对比度", null, contrast, contrastValue));
+            hardwareCard.Controls.Add(NewAdaptiveSliderRow("饱和度", saturationBackend, saturation, saturationValue));
+            saturationHint.Dock = DockStyle.Top; saturationHint.Height = 46;
+            hardwareCard.Controls.Add(saturationHint);
+            var hardwareActions = NewAdaptiveGrid(3, 40);
+            hardwareActions.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            hardwareActions.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            hardwareActions.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            liveApply.AutoSize = true; hardwareActions.Controls.Add(liveApply, 0, 0);
+            hardwareActions.Controls.Add(syncAllDisplays, 1, 0);
+            hardwareActions.Controls.Add(apply, 2, 0);
+            hardwareCard.Controls.Add(hardwareActions);
+            page.Controls.Add(hardwareCard);
+
+            var styleAdaptiveCard = NewAdaptiveCard(ThemeManager.Current.TintSurface);
+            styleAdaptiveCard.Tag = "TintContainer";
+            var styleHead = NewAdaptiveGrid(4, 38);
+            styleHead.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            styleHead.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            styleHead.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            styleHead.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            styleHead.Controls.Add(NewAdaptiveText("画面风格", true, 12F), 0, 0);
+            styleHead.Controls.Add(NewAdaptiveText("强度档位", true), 1, 0);
+            styleHead.Controls.Add(strengthBox, 2, 0);
+            styleHead.Controls.Add(exportLut, 3, 0);
+            styleAdaptiveCard.Controls.Add(styleHead);
+            styleAdaptiveCard.Controls.Add(NewAdaptiveText("选择预设，或直接拖动参数微调", false));
+            var presetRow = NewAdaptiveGrid(5, 40);
+            presetRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            for (int i = 1; i < 5; i++) presetRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            stylePresetBox.Dock = DockStyle.Fill; presetRow.Controls.Add(stylePresetBox, 0, 0);
+            presetRow.Controls.Add(applyStyle, 1, 0); presetRow.Controls.Add(saveStyle, 2, 0);
+            presetRow.Controls.Add(manageStyles, 3, 0); presetRow.Controls.Add(configureHotkeys, 4, 0);
+            styleAdaptiveCard.Controls.Add(presetRow);
+
+            var styleGrid = NewAdaptiveGrid(3, 0);
+            for (int i = 0; i < 3; i++) styleGrid.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 33.333F));
+            AddStyleCell(styleGrid, 0, 0, "提亮暗部", styleShadows, styleShadowValue);
+            AddStyleCell(styleGrid, 1, 0, "压低高光", styleHighlights, styleHighlightValue);
+            AddStyleCell(styleGrid, 2, 0, "中间调", styleMidtones, styleMidtoneValue);
+            AddStyleCell(styleGrid, 0, 1, "黑位", styleBlackPoint, styleBlackPointValue);
+            AddStyleCell(styleGrid, 1, 1, "白位", styleWhitePoint, styleWhitePointValue);
+            AddStyleCell(styleGrid, 2, 1, "中间对比", styleContrastPivot, styleContrastPivotValue);
+            AddStyleCell(styleGrid, 0, 2, "色温", styleTemperature, styleTemperatureValue);
+            AddStyleCell(styleGrid, 1, 2, "色调", styleTint, styleTintValue);
+            AddStyleCell(styleGrid, 2, 2, "自然色彩", styleVibrance, styleVibranceValue);
+            AddStyleCell(styleGrid, 0, 3, "整体曝光", styleExposure, styleExposureValue);
+            AddStyleCell(styleGrid, 1, 3, "暗部范围", styleShadowRange, styleShadowRangeValue);
+            AddStyleCell(styleGrid, 2, 3, "高光范围", styleHighlightRange, styleHighlightRangeValue);
+            AddStyleCell(styleGrid, 0, 4, "过渡柔和", styleTransitionSoftness, styleTransitionSoftnessValue);
+            styleAdaptiveCard.Controls.Add(styleGrid);
+            var curveHeader = NewAdaptiveGrid(2, 28);
+            curveHeader.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            curveHeader.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            curveHeader.Controls.Add(NewAdaptiveText("实时明暗曲线", true), 0, 0);
+            curveHeader.Controls.Add(NewAdaptiveText("虚线：原始 · 实线：当前", false), 1, 0);
+            styleAdaptiveCard.Controls.Add(curveHeader);
+            liveToneCurve.Size = new Size(600, 190);
+            liveToneCurve.Margin = new Padding(0, 0, 0, 6);
+            liveToneCurve.Tag = "TintControl";
+            styleAdaptiveCard.Controls.Add(liveToneCurve);
+            UpdateLiveToneCurve();
+            var riskRow = NewAdaptiveGrid(3, 54);
+            riskRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            riskRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            riskRow.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            styleRiskStatus.Dock = DockStyle.Fill; riskRow.Controls.Add(styleRiskStatus, 0, 0);
+            riskRow.Controls.Add(optimizeStyle, 1, 0); riskRow.Controls.Add(restoreStyle, 2, 0);
+            styleAdaptiveCard.Controls.Add(riskRow); page.Controls.Add(styleAdaptiveCard);
+
+            var bottom = NewAdaptiveCard(ThemeManager.Current.SoftSurface);
+            bottom.Tag = "SoftContainer";
+            restoreOnExit.AutoSize = true; bottom.Controls.Add(restoreOnExit);
+            bottom.Controls.Add(NewAdaptiveText("后台快捷键可自由分配；最小化后仍可切换画面风格", false));
+            status.AutoSize = true; status.MaximumSize = new Size(740, 0); page.Controls.Add(status);
+            var footer = NewAdaptiveGrid(2, 30);
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            footer.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            footer.Controls.Add(authorFooter, 0, 0); footer.Controls.Add(sharingFooter, 1, 0);
+            // Footer labels are hosted by the fixed application footer below.
+
+            // LP-style application shell: custom chrome, a stable navigation
+            // rail and one scroll owner for all functional cards.
+            var shell = new TableLayoutPanel {
+                Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 3,
+                Margin = new Padding(0), Padding = new Padding(0),
+                BackColor = Canvas, Tag = "CanvasContainer"
+            };
+            shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 214F));
+            shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 96F));
+            shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+            shell.RowStyles.Add(new RowStyle(SizeType.Absolute, 34F));
+
+            var topBar = new TableLayoutPanel {
+                Dock = DockStyle.Fill, ColumnCount = 7, RowCount = 1,
+                Margin = new Padding(0), Padding = new Padding(25, 12, 18, 12),
+                BackColor = Canvas, Tag = "CanvasContainer"
+            };
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44F));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44F));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 44F));
+            topBar.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 4F));
+
+            var brandRow = new TableLayoutPanel {
+                Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
+                Margin = new Padding(0), Padding = new Padding(0), BackColor = Canvas,
+                Tag = "CanvasContainer"
+            };
+            brandRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 56F));
+            brandRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            logo.Location = Point.Empty; logo.Size = new Size(46, 46);
+            logo.Anchor = AnchorStyles.Left;
+            brandRow.Controls.Add(logo, 0, 0);
+            brand.Dock = DockStyle.Fill; brandRow.Controls.Add(brand, 1, 0);
+            topBar.Controls.Add(brandRow, 0, 0);
+            toolsCenter.Width = 105; toolsCenter.Height = 36;
+            toolsCenter.Anchor = AnchorStyles.None;
+            toolsCenter.Margin = new Padding(8, 0, 8, 0);
+            toolsCenter.Tag = "CanvasPrimaryButton";
+            topBar.Controls.Add(toolsCenter, 1, 0);
+            themeArea.Anchor = AnchorStyles.None;
+            themeArea.Margin = new Padding(8, 0, 18, 0);
+            topBar.Controls.Add(themeArea, 2, 0);
+
+            var minimizeButton = NewChromeButton("—");
+            var maximizeButton = NewChromeButton("□");
+            var closeButton = NewChromeButton("×");
+            minimizeButton.Click += delegate { WindowState = FormWindowState.Minimized; };
+            maximizeButton.Click += delegate { ToggleMaximize(); };
+            closeButton.Click += delegate { Close(); };
+            topBar.Controls.Add(minimizeButton, 3, 0);
+            topBar.Controls.Add(maximizeButton, 4, 0);
+            topBar.Controls.Add(closeButton, 5, 0);
+            shell.Controls.Add(topBar, 0, 0);
+            shell.SetColumnSpan(topBar, 2);
+
+            var navigation = new FlowLayoutPanel {
+                Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown,
+                WrapContents = false, Padding = new Padding(18, 22, 18, 14),
+                Margin = new Padding(0), BackColor = ThemeManager.Current.SoftSurface,
+                Tag = "SoftContainer"
+            };
+            var navTitle = NewAdaptiveText("功能板块", false, 8.5F);
+            navTitle.Margin = new Padding(5, 0, 0, 8);
+            navigation.Controls.Add(navTitle);
+            var hardwareNav = NewNavigationButton("显示控制", true);
+            var styleNav = NewNavigationButton("画面风格", false);
+            var settingsNav = NewNavigationButton("工具中心", false);
+            navigation.Controls.Add(hardwareNav);
+            navigation.Controls.Add(styleNav);
+            navigation.Controls.Add(settingsNav);
+            var boundary = NewAdaptiveText("外部显示控制\n不注入游戏 · 不叠加画面", false, 8F);
+            boundary.Margin = new Padding(5, 24, 0, 0);
+            navigation.Controls.Add(boundary);
+            shell.Controls.Add(navigation, 0, 1);
+
+            var displayHeading = NewPageHeading("显示控制", "显示器硬件参数与多屏同步设置");
+            page.Controls.Add(displayHeading);
+            page.Controls.SetChildIndex(displayHeading, 0);
+            page.Padding = new Padding(26, 22, 24, 20);
+
+            var stylePage = NewAdaptivePage();
+            stylePage.Tag = "CanvasContainer";
+            stylePage.Padding = new Padding(26, 22, 24, 20);
+            stylePage.Controls.Add(NewPageHeading("画面风格", "预设、明暗曲线与色彩参数微调"));
+            stylePage.Controls.Add(styleAdaptiveCard);
+
+            var toolsPage = NewAdaptivePage();
+            toolsPage.Tag = "CanvasContainer";
+            toolsPage.Padding = new Padding(26, 22, 24, 20);
+            toolsPage.Controls.Add(NewPageHeading("工具中心", "原画对比、自动切换、分享代码与环境诊断"));
+            var embeddedTools = new ToolsCenterForm(
+                styleStore, appSettings,
+                delegate { temporaryA = CaptureCurrentStyle("临时 A"); },
+                delegate { temporaryB = CaptureCurrentStyle("临时 B"); },
+                delegate(bool useA) {
+                    var preset = useA ? temporaryA : temporaryB;
+                    if (preset != null) ApplyStylePreset(preset);
+                },
+                BuildEnvironmentDiagnosis, restoreOnExit);
+            embeddedTools.SettingsChanged += delegate {
+                styleStore.Save(); appSettings.Save(); lastAutoProcess = "";
+                RegisterGlobalHotkeys(); UpdateGameRuleTimer();
+            };
+            embeddedTools.ConfigureEmbedded();
+            var toolsHost = new Panel {
+                Height = 680, MinimumSize = new Size(620, 680),
+                Margin = new Padding(0), BackColor = Canvas,
+                Tag = "EmbeddedToolsHost"
+            };
+            toolsHost.Controls.Add(embeddedTools);
+            toolsPage.Controls.Add(toolsHost);
+            embeddedTools.Show();
+
+            // Each navigation entry owns a real page. Only one page participates
+            // in layout and painting at a time.
+            stylePage.Visible = false;
+            toolsPage.Visible = false;
+            var contentHost = new Panel { Dock = DockStyle.Fill, Margin = new Padding(0), Tag = "CanvasContainer" };
+            contentHost.Controls.Add(toolsPage);
+            contentHost.Controls.Add(stylePage);
+            contentHost.Controls.Add(page);
+            shell.Controls.Add(contentHost, 1, 1);
+            hardwareNav.Click += delegate { SelectPage(page, hardwareNav, styleNav, settingsNav); };
+            styleNav.Click += delegate { SelectPage(stylePage, styleNav, hardwareNav, settingsNav); };
+            settingsNav.Click += delegate { SelectPage(toolsPage, settingsNav, hardwareNav, styleNav); };
+            toolsCenter.Click += delegate { SelectPage(toolsPage, settingsNav, hardwareNav, styleNav); };
+
+            var appFooter = new TableLayoutPanel {
+                Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1,
+                Margin = new Padding(0), Padding = new Padding(24, 6, 24, 4),
+                BackColor = ThemeManager.Current.SoftSurface, Tag = "SoftContainer"
+            };
+            appFooter.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            appFooter.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            authorFooter.Text = "BY XD · 免费分享，倒卖必究";
+            sharingFooter.Text = "ShadePilot BETA 0.4.5";
+            authorFooter.Tag = "SoftMuted"; sharingFooter.Tag = "SoftMuted";
+            appFooter.Controls.Add(authorFooter, 0, 0);
+            appFooter.Controls.Add(sharingFooter, 1, 0);
+            shell.Controls.Add(appFooter, 0, 2);
+            shell.SetColumnSpan(appFooter, 2);
+            Controls.Add(shell);
+            WireWindowDrag(topBar);
+            topBar.DoubleClick += delegate { ToggleMaximize(); };
+            brandRow.DoubleClick += delegate { ToggleMaximize(); };
+            resizeUiTimer.Interval = 100;
+            resizeUiTimer.Tick += delegate {
+                resizeUiTimer.Stop();
+                FitAdaptiveContent(page);
+                FitAdaptiveContent(stylePage);
+                FitAdaptiveContent(toolsPage);
+                UpdateWindowShape();
+                Invalidate(true);
+            };
+            ResizeBegin += delegate { Region = null; };
+            ResizeEnd += delegate { QueueResizeLayout(); };
+            Resize += delegate {
+                maximizeButton.Text = WindowState == FormWindowState.Maximized ? "❐" : "□";
+                QueueResizeLayout();
+            };
             brightnessValue.Location = new Point(620, 194);
             brightnessValue.ForeColor = Accent;
             brightnessValue.AutoSize = true;
@@ -407,10 +755,15 @@ namespace DisplayPresetPrototype
 
             AssignThemeRoles(mainCard, styleCard, null, actionCard,
                 themeLabel, refresh, apply, restore, applyStyle, saveStyle,
-                manageStyles, configureHotkeys, curvePreview, restoreStyle, optimizeStyle);
+                manageStyles, configureHotkeys, restoreStyle, optimizeStyle,
+                exportLut,
+                toolsCenter);
             ConfigureToolTips(
                 refresh, apply, restore, restoreStyle,
-                applyStyle, saveStyle, manageStyles, configureHotkeys, curvePreview, optimizeStyle);
+                applyStyle, saveStyle, manageStyles, configureHotkeys, exportLut, optimizeStyle);
+            SetHelp(exportLut, "将当前画面风格导出为 .cube 3D LUT，供 OBS 的“应用 LUT”滤镜使用。");
+            toolsCenter.BringToFront();
+            SetHelp(toolsCenter, "打开原画与 A/B 对比、游戏自动切换、预设分享代码和环境诊断。");
             ApplyTheme(ThemeManager.Current);
             UpdateStyleRiskStatus();
             themeBox.SelectedItem = ThemeManager.Current;
@@ -419,12 +772,17 @@ namespace DisplayPresetPrototype
                 if (selectedTheme == null) return;
                 ThemeManager.Set(selectedTheme);
                 ApplyTheme(selectedTheme);
+                SecondaryWindowTheme.Apply(embeddedTools);
                 UpdateStyleRiskStatus();
             };
 
             FormClosing += OnFormClosing;
             Resize += OnWindowResize;
             Shown += delegate {
+                UpdateWindowShape();
+                FitAdaptiveContent(page);
+                FitAdaptiveContent(stylePage);
+                FitAdaptiveContent(toolsPage);
                 RegisterGlobalHotkeys();
                 if (appSettings.StartMinimized)
                     BeginInvoke((MethodInvoker)delegate { WindowState = FormWindowState.Minimized; });
@@ -434,22 +792,31 @@ namespace DisplayPresetPrototype
                     BeginInvoke((MethodInvoker)delegate { RegisterGlobalHotkeys(); });
             };
             ConfigureTrayIcon();
-            recoveryTimer.Interval = 1400;
+            recoveryTimer.Interval = 2200;
             recoveryTimer.Tick += delegate {
                 recoveryTimer.Stop();
                 if (closing || !appSettings.AutoReapply) return;
+                if (performanceProtectionActive)
+                {
+                    displayRecoveryDeferredForGame = true;
+                    return;
+                }
+                reapplyStyleAfterRefresh = gammaController.IsCaptured;
                 RefreshDisplays();
-                if (gammaController.IsCaptured) ApplyStylePreview();
+                UpdateGameRuleTimer();
             };
             SystemEvents.DisplaySettingsChanged += OnDisplayEnvironmentChanged;
             SystemEvents.PowerModeChanged += OnPowerModeChanged;
+            gameRuleTimer.Interval = 2000;
+            gameRuleTimer.Tick += delegate { CheckGameAutoSwitch(); };
+            UpdateGameRuleTimer();
             RefreshDisplays();
         }
 
         private void ConfigureToolTips(
             Button refresh, Button apply, Button restore, Button restoreStyle,
             Button applyStyle, Button saveStyle, Button manageStyles,
-            Button configureHotkeys, Button curvePreview, Button optimizeStyle)
+            Button configureHotkeys, Button exportLut, Button optimizeStyle)
         {
             helpTip.IsBalloon = true;
             helpTip.AutoPopDelay = 9000;
@@ -461,8 +828,9 @@ namespace DisplayPresetPrototype
             SetHelp(refresh, "重新扫描显示器并读取它支持的 DDC/CI 调节项目。");
             SetHelp(brightness, "调节显示器背光亮度。它会改变屏幕整体发光强度，不等同于提亮暗部。");
             SetHelp(contrast, "调节显示器硬件对比度。过高可能造成亮部或暗部细节丢失。");
-            SetHelp(saturation, "调节显示器提供的硬件饱和度。仅在显示器支持 VCP 0x8A 时可用。");
+            SetHelp(saturation, "显示器支持时调节 DDC/CI 硬件饱和度；不支持时自动改用 Windows 全屏软件饱和度。");
             SetHelp(liveApply, "开启后，拖动硬件滑块会在短暂防抖后自动写入显示器。");
+            SetHelp(syncAllDisplays, "开启后，画面风格、预设快捷键和重置会同步到所有显示器；硬件亮度与对比度仍只调整当前显示器。");
             SetHelp(apply, "立即写入当前亮度、对比度、硬件饱和度和硬件色温。");
             SetHelp(themeBox, "只改变 ShadePilot 自身的界面配色，不影响游戏画面。");
 
@@ -472,7 +840,7 @@ namespace DisplayPresetPrototype
             SetHelp(saveStyle, "将当前九项画面参数保存为新预设，或覆盖同名预设。");
             SetHelp(manageStyles, "重命名、修改或删除画面风格预设。");
             SetHelp(configureHotkeys, "为每个画面风格和恢复原始画面录入全局快捷键。");
-            SetHelp(curvePreview, "查看当前明暗参数合成后的输入/输出曲线，辅助判断压黑或高光压缩程度。");
+            SetHelp(exportLut, "将当前画面风格导出为 .cube 3D LUT，供 OBS 的“应用 LUT”滤镜使用。");
             SetHelp(optimizeStyle, "只修正当前参数中明显的灰雾、重复压缩、裁切和互相抵消，不会更换预设。");
             SetHelp(styleRiskStatus, "实时检查灰雾、端点裁切、重复压缩和参数互相抵消。");
 
@@ -578,19 +946,26 @@ namespace DisplayPresetPrototype
         private static Label NewLabel(string text, int x, int y)
         {
             return new Label {
-                Text = text, AutoSize = true, Location = new Point(x, y),
+                // Keep the label's painted bounds clear of the TrackBar below.
+                // The old 27 px label started only 25 px above the slider, so
+                // the later-added TrackBar covered the lower half of glyphs
+                // after WinForms rounded coordinates at 150%-200% DPI.
+                Text = text, AutoSize = false, Location = new Point(x, y - 4),
+                Size = new Size(140, 22), TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
                 ForeColor = Ink, Font = new Font("Microsoft YaHei UI", 9F, FontStyle.Bold),
-                BackColor = Color.White, Padding = new Padding(0, 2, 0, 1)
+                BackColor = Color.White
             };
         }
 
         private static Label NewSectionTitle(string text, int x, int y)
         {
             return new Label {
-                Text = text, AutoSize = true, Location = new Point(x, y),
+                Text = text, AutoSize = false, Location = new Point(x, y - 4),
+                Size = new Size(180, 28), TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
                 ForeColor = Ink, BackColor = Color.White,
-                Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold),
-                Padding = new Padding(0, 2, 0, 1)
+                Font = new Font("Microsoft YaHei UI", 12F, FontStyle.Bold)
             };
         }
 
@@ -604,10 +979,11 @@ namespace DisplayPresetPrototype
         private static Label NewMutedLabel(string text, int x, int y)
         {
             return new Label {
-                Text = text, AutoSize = true, Location = new Point(x, y),
+                Text = text, AutoSize = false, Location = new Point(x, y - 2),
+                Size = new Size(360, 22), TextAlign = ContentAlignment.MiddleLeft,
+                AutoEllipsis = true,
                 ForeColor = Muted, BackColor = Color.White,
-                Font = new Font("Microsoft YaHei UI", 8F),
-                Padding = new Padding(0, 2, 0, 1)
+                Font = new Font("Microsoft YaHei UI", 8F)
             };
         }
 
@@ -622,6 +998,14 @@ namespace DisplayPresetPrototype
         {
             var label = NewLabel(text, x, y);
             label.BackColor = Color.FromArgb(249, 248, 255);
+            return label;
+        }
+
+        private static Label NewTintedCompactLabel(
+            string text, int x, int y, int width)
+        {
+            var label = NewTintedLabel(text, x, y);
+            label.Size = new Size(width, label.Height);
             return label;
         }
 
@@ -660,6 +1044,227 @@ namespace DisplayPresetPrototype
             };
         }
 
+        private static FlowLayoutPanel NewAdaptivePage()
+        {
+            return new FlowLayoutPanel {
+                Dock = DockStyle.Fill, AutoScroll = true,
+                FlowDirection = FlowDirection.TopDown, WrapContents = false,
+                Padding = new Padding(24, 18, 24, 28), BackColor = Canvas
+            };
+        }
+
+        private static RoundedFlowLayoutPanel NewAdaptiveCard(Color color)
+        {
+            return new RoundedFlowLayoutPanel {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                MinimumSize = new Size(632, 0), MaximumSize = new Size(1100, 0),
+                FlowDirection = FlowDirection.TopDown, WrapContents = false,
+                Padding = new Padding(14), Margin = new Padding(0, 0, 0, 12),
+                FillColor = color, CornerRadius = 12
+            };
+        }
+
+        private static FlowLayoutPanel NewAdaptiveFlow(FlowDirection direction)
+        {
+            return new FlowLayoutPanel {
+                AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                FlowDirection = direction, WrapContents = false,
+                Margin = new Padding(0), Padding = new Padding(0)
+            };
+        }
+
+        private static TableLayoutPanel NewAdaptiveGrid(int columns, int height)
+        {
+            return new TableLayoutPanel {
+                ColumnCount = columns, RowCount = 1,
+                AutoSize = height == 0, AutoSizeMode = AutoSizeMode.GrowAndShrink,
+                Height = height, Width = 604, Margin = new Padding(0, 0, 0, 8),
+                GrowStyle = TableLayoutPanelGrowStyle.AddRows
+            };
+        }
+
+        private static Label NewAdaptiveText(string text, bool bold, float size = 9F)
+        {
+            return new Label {
+                Text = text, AutoSize = true, MaximumSize = new Size(560, 0),
+                Margin = new Padding(4, 5, 4, 4), ForeColor = bold ? Ink : Muted,
+                Font = new Font("Microsoft YaHei UI", size,
+                    bold ? FontStyle.Bold : FontStyle.Regular)
+            };
+        }
+
+        private static RoundedButton NewChromeButton(string text)
+        {
+            var button = NewButton(text, 0, 0, 36);
+            button.Size = new Size(38, 32);
+            button.Anchor = AnchorStyles.None;
+            button.Margin = new Padding(3);
+            button.CornerRadius = 8;
+            button.Font = new Font("Segoe UI", 10F, FontStyle.Regular);
+            button.Tag = "ChromeButton";
+            return button;
+        }
+
+        private static FlowLayoutPanel NewPageHeading(string title, string subtitle)
+        {
+            var heading = NewAdaptiveFlow(FlowDirection.TopDown);
+            heading.Controls.Add(NewAdaptiveText(title, true, 20F));
+            heading.Controls.Add(NewAdaptiveText(subtitle, false, 9F));
+            heading.Margin = new Padding(0, 0, 0, 12);
+            return heading;
+        }
+
+        private static RoundedButton NewNavigationButton(string text, bool selected)
+        {
+            var button = NewButton((selected ? "•  " : "   ") + text, 0, 0, 178);
+            button.Width = 178;
+            button.Height = 42;
+            button.Margin = new Padding(0, 0, 0, 6);
+            button.TextAlign = ContentAlignment.MiddleLeft;
+            button.Padding = new Padding(14, 0, 0, 0);
+            button.Tag = selected ? "NavSelectedButton" : "NavButton";
+            return button;
+        }
+
+        private void SelectPage(FlowLayoutPanel selectedPage,
+            RoundedButton selected, params RoundedButton[] others)
+        {
+            selected.Tag = "NavSelectedButton";
+            selected.Text = "•  " + selected.Text.TrimStart('•', ' ');
+            foreach (var button in others)
+            {
+                button.Tag = "NavButton";
+                button.Text = "   " + button.Text.TrimStart('•', ' ');
+            }
+            ApplyTheme(ThemeManager.Current);
+            Control parent = selectedPage.Parent;
+            if (parent != null)
+            {
+                foreach (Control page in parent.Controls) page.Visible = page == selectedPage;
+                selectedPage.BringToFront();
+            }
+            selectedPage.AutoScrollPosition = Point.Empty;
+            FitAdaptiveContent(selectedPage);
+        }
+
+        private void QueueResizeLayout()
+        {
+            resizeUiTimer.Stop();
+            resizeUiTimer.Start();
+        }
+
+        private void WireWindowDrag(Control control)
+        {
+            control.MouseDown += delegate(object sender, MouseEventArgs e) {
+                if (e.Button != MouseButtons.Left || WindowState == FormWindowState.Maximized) return;
+                ReleaseCapture();
+                SendMessage(Handle, WmNcLButtonDown, new IntPtr(HtCaption), IntPtr.Zero);
+            };
+            foreach (Control child in control.Controls)
+            {
+                if (child is Button || child is ComboBox) continue;
+                WireWindowDrag(child);
+            }
+        }
+
+        private void ToggleMaximize()
+        {
+            WindowState = WindowState == FormWindowState.Maximized
+                ? FormWindowState.Normal : FormWindowState.Maximized;
+        }
+
+        private void FitAdaptiveContent(FlowLayoutPanel page)
+        {
+            int scrollbar = page.VerticalScroll.Visible ? SystemInformation.VerticalScrollBarWidth : 0;
+            int width = Math.Max(632, page.ClientSize.Width - page.Padding.Horizontal - scrollbar - 2);
+            foreach (Control control in page.Controls)
+            {
+                var card = control as RoundedFlowLayoutPanel;
+                if (card != null)
+                {
+                    card.MinimumSize = new Size(width, 0);
+                    card.MaximumSize = new Size(width, 0);
+                    card.Width = width;
+                    FitAdaptiveChildren(card, Math.Max(560, width - card.Padding.Horizontal));
+                }
+                else if (control is TableLayoutPanel || control is FlowLayoutPanel)
+                    control.Width = width;
+                else if (Equals(control.Tag, "EmbeddedToolsHost"))
+                    control.Width = width;
+            }
+        }
+
+        private static void FitAdaptiveChildren(Control parent, int width)
+        {
+            foreach (Control child in parent.Controls)
+            {
+                var table = child as TableLayoutPanel;
+                if (table != null) table.Width = width;
+                var curve = child as ToneCurveGraph;
+                if (curve != null) curve.Width = width;
+                if (child.HasChildren && !(child is ComboBox))
+                    FitAdaptiveChildren(child, Math.Max(120, child.ClientSize.Width - child.Padding.Horizontal));
+            }
+        }
+
+        private void UpdateWindowShape()
+        {
+            Region previous = Region;
+            Region = null;
+            if (previous != null) previous.Dispose();
+            // Windows 11 can round the native top-level surface in the DWM
+            // compositor. Unlike a managed Region this does not rebuild and
+            // clip every child control during maximize/restore animation.
+            int preference = WindowState == FormWindowState.Maximized ? 1 : 2;
+            try
+            {
+                DwmSetWindowAttribute(Handle, 33, ref preference, sizeof(int));
+            }
+            catch { }
+        }
+
+        private static TableLayoutPanel NewAdaptiveSliderRow(
+            string caption, ComboBox backend, TrackBar slider, Label value)
+        {
+            var row = NewAdaptiveGrid(3, 70);
+            row.RowCount = 2;
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            row.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48F));
+            var label = NewAdaptiveText(caption, true);
+            row.Controls.Add(label, 0, 0);
+            if (backend != null)
+            {
+                backend.Anchor = AnchorStyles.Left | AnchorStyles.Right;
+                backend.Margin = new Padding(8, 1, 4, 1);
+                row.Controls.Add(backend, 1, 0);
+            }
+            value.AutoSize = false; value.Dock = DockStyle.Fill;
+            value.TextAlign = ContentAlignment.MiddleCenter;
+            row.Controls.Add(value, 2, 0);
+            slider.Dock = DockStyle.Fill; slider.Margin = new Padding(4, 2, 4, 2);
+            row.Controls.Add(slider, 0, 1); row.SetColumnSpan(slider, 3);
+            return row;
+        }
+
+        private static void AddStyleCell(TableLayoutPanel grid, int column, int row,
+            string caption, TrackBar slider, Label value)
+        {
+            var cell = new TableLayoutPanel {
+                ColumnCount = 2, RowCount = 2, Dock = DockStyle.Fill,
+                AutoSize = true, Margin = new Padding(4), Padding = new Padding(0, 2, 0, 4)
+            };
+            cell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+            cell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 48F));
+            cell.Controls.Add(NewAdaptiveText(caption, true), 0, 0);
+            value.AutoSize = false; value.Dock = DockStyle.Fill;
+            value.TextAlign = ContentAlignment.MiddleCenter;
+            cell.Controls.Add(value, 1, 0);
+            slider.Dock = DockStyle.Fill; slider.Margin = new Padding(0, 2, 0, 0);
+            cell.Controls.Add(slider, 0, 1); cell.SetColumnSpan(slider, 2);
+            grid.Controls.Add(cell, column, row);
+        }
+
         private void AssignThemeRoles(
             RoundedPanel main, RoundedPanel tint, RoundedPanel preset, RoundedPanel action,
             Label themeLabel, params RoundedButton[] buttons)
@@ -672,12 +1277,19 @@ namespace DisplayPresetPrototype
             titleRole(Controls);
 
             foreach (var button in buttons)
-                button.Tag = button.ForeColor == Color.White ? "PrimaryButton" : "SecondaryButton";
+            {
+                bool primary = button.ForeColor == Color.White;
+                button.Tag = button.Location.Y < 80
+                    ? (primary ? "CanvasPrimaryButton" : "CanvasSecondaryButton")
+                    : (primary ? "PrimaryButton" : "SecondaryButton");
+            }
             themeBox.Tag = "CanvasCombo";
             stylePresetBox.Tag = "TintCombo";
             strengthBox.Tag = "TintCombo";
             monitorBox.Tag = "SurfaceCombo";
+            saturationBackend.Tag = "SurfaceCombo";
             liveApply.Tag = "SurfaceMuted";
+            syncAllDisplays.Tag = "SurfaceMuted";
             restoreOnExit.Tag = "SoftMuted";
             styleShadows.Tag = styleHighlights.Tag = styleMidtones.Tag =
                 styleBlackPoint.Tag = styleWhitePoint.Tag = styleContrastPivot.Tag =
@@ -697,6 +1309,7 @@ namespace DisplayPresetPrototype
         {
             foreach (Control control in controls)
             {
+                if (control.HasChildren) titleRole(control.Controls);
                 if (control.Tag != null || control == status) continue;
                 var label = control as Label;
                 if (label != null)
@@ -717,10 +1330,34 @@ namespace DisplayPresetPrototype
         private void ApplyTheme(AppTheme theme)
         {
             BackColor = theme.Canvas;
-            foreach (Control control in Controls)
+            ApplyThemeToControls(Controls, theme, "Canvas");
+            status.ForeColor = theme.Muted;
+            Invalidate(true);
+        }
+
+        private void ApplyThemeToControls(Control.ControlCollection controls, AppTheme theme,
+            string inheritedSurface)
+        {
+            foreach (Control control in controls)
             {
                 string role = control.Tag as string;
-                if (role == null) continue;
+                string surface = role == "TintContainer" ? "Tint" :
+                    role == "SoftContainer" ? "Soft" :
+                    role == "SurfaceContainer" ? "Surface" :
+                    role == "CanvasContainer" ? "Canvas" : inheritedSurface;
+                Color surfaceColor = surface == "Tint" ? theme.TintSurface :
+                    surface == "Soft" ? theme.SoftSurface :
+                    surface == "Surface" ? theme.Surface : theme.Canvas;
+                var roundedFlow = control as RoundedFlowLayoutPanel;
+                if (roundedFlow != null)
+                {
+                    roundedFlow.FillColor = surfaceColor;
+                    roundedFlow.BorderColor = BlendColor(surfaceColor, theme.Muted, 0.28F);
+                    roundedFlow.Invalidate();
+                }
+                var layout = control as Panel;
+                if (layout != null && !(layout is RoundedPanel) && roundedFlow == null)
+                    layout.BackColor = surfaceColor;
                 var panel = control as RoundedPanel;
                 if (panel != null)
                 {
@@ -732,12 +1369,18 @@ namespace DisplayPresetPrototype
                 var button = control as RoundedButton;
                 if (button != null)
                 {
-                    bool primary = role == "PrimaryButton";
-                    button.BackColor = primary ? theme.Accent : theme.Button;
-                    button.ForeColor = primary ? theme.OnAccent : theme.Ink;
-                    button.SurfaceColor =
-                        button.Location.Y >= 447 && button.Location.Y < 1001 ? theme.TintSurface :
-                        button.Location.Y >= 1013 ? theme.SoftSurface : theme.Surface;
+                    bool primary = role == "PrimaryButton" || role == "CanvasPrimaryButton";
+                    bool navSelected = role == "NavSelectedButton";
+                    bool nav = role == "NavButton";
+                    bool chrome = role == "ChromeButton";
+                    button.BackColor = primary ? theme.Accent :
+                        navSelected ? theme.AccentSoft :
+                        nav ? theme.SoftSurface :
+                        chrome ? theme.TintSurface : theme.Button;
+                    button.ForeColor = primary ? theme.OnAccent :
+                        navSelected ? theme.Ink :
+                        (nav || chrome) ? theme.Muted : theme.Ink;
+                    button.SurfaceColor = (nav || navSelected) ? theme.SoftSurface : surfaceColor;
                     button.Invalidate();
                     continue;
                 }
@@ -749,19 +1392,27 @@ namespace DisplayPresetPrototype
                     pill.Invalidate();
                     continue;
                 }
-                bool muted = role.EndsWith("Muted", StringComparison.Ordinal);
+                bool muted = role != null && role.EndsWith("Muted", StringComparison.Ordinal);
                 control.ForeColor = muted ? theme.Muted : theme.Ink;
-                if (role.StartsWith("Canvas", StringComparison.Ordinal)) control.BackColor = theme.Canvas;
-                else if (role.StartsWith("Tint", StringComparison.Ordinal)) control.BackColor = theme.TintSurface;
-                else if (role.StartsWith("Soft", StringComparison.Ordinal)) control.BackColor = theme.SoftSurface;
-                else control.BackColor = theme.Surface;
+                control.BackColor = surfaceColor;
                 var themedCombo = control as ThemedComboBox;
                 if (themedCombo != null)
-                    themedCombo.BorderColor = control.BackColor;
+                    themedCombo.BorderColor = BlendColor(
+                        surfaceColor, theme.Accent, 0.28F);
                 control.Invalidate();
+                if (control.HasChildren)
+                    ApplyThemeToControls(control.Controls, theme, surface);
             }
-            status.ForeColor = theme.Muted;
-            Invalidate(true);
+        }
+
+        private static Color BlendColor(Color background, Color foreground, float amount)
+        {
+            amount = Math.Max(0F, Math.Min(1F, amount));
+            return Color.FromArgb(
+                255,
+                (int)Math.Round(background.R + (foreground.R - background.R) * amount),
+                (int)Math.Round(background.G + (foreground.G - background.G) * amount),
+                (int)Math.Round(background.B + (foreground.B - background.B) * amount));
         }
 
         private PhysicalDisplay Selected
@@ -772,30 +1423,74 @@ namespace DisplayPresetPrototype
             }
         }
 
-        private void RefreshDisplays()
+        private async void RefreshDisplays()
         {
-            foreach (var d in displays) d.Dispose();
+            if (displayRefreshRunning)
+            {
+                displayRefreshPending = true;
+                return;
+            }
+            displayRefreshRunning = true;
+            displayRefreshPending = false;
+            var oldDisplays = new List<PhysicalDisplay>(displays);
             displays.Clear();
+            rebuildingDisplayList = true;
             monitorBox.Items.Clear();
+            rebuildingDisplayList = false;
             try
             {
-                displays.AddRange(MonitorApi.Enumerate());
+                var detected = await System.Threading.Tasks.Task.Run(delegate {
+                    foreach (var oldDisplay in oldDisplays)
+                    {
+                        try { oldDisplay.Dispose(); } catch { }
+                    }
+                    var found = MonitorApi.Enumerate();
+                    foreach (var display in found)
+                    {
+                        try { display.Refresh(); }
+                        catch { display.MarkProbeFailed(); }
+                    }
+                    return found;
+                });
+                if (closing)
+                {
+                    foreach (var display in detected) display.Dispose();
+                    return;
+                }
+                displays.AddRange(detected);
+                rebuildingDisplayList = true;
                 foreach (var d in displays) monitorBox.Items.Add(d.Name);
                 if (displays.Count > 0)
                 {
                     monitorBox.SelectedIndex = 0;
+                    rebuildingDisplayList = false;
+                    LoadSelectedMonitor(false);
                     SetStatus("已检测到 " + displays.Count + " 个物理显示器。", false);
+                    if (reapplyStyleAfterRefresh)
+                    {
+                        reapplyStyleAfterRefresh = false;
+                        ApplyStylePreview();
+                    }
                 }
                 else
                 {
+                    rebuildingDisplayList = false;
                     DisableControls();
                     SetStatus("没有发现可通过 Windows DDC/CI 访问的物理显示器。", true);
                 }
             }
             catch (Exception ex)
             {
+                rebuildingDisplayList = false;
                 DisableControls();
                 SetStatus("检测失败：" + ex.Message, true);
+            }
+            finally
+            {
+                rebuildingDisplayList = false;
+                displayRefreshRunning = false;
+                if (displayRefreshPending && !closing)
+                    BeginInvoke((MethodInvoker)RefreshDisplays);
             }
         }
 
@@ -805,6 +1500,7 @@ namespace DisplayPresetPrototype
             if (d == null) return;
             try
             {
+                gammaController.SetTarget(d.DisplayDeviceName);
                 if (refreshHardware) d.Refresh();
                 brightness.Enabled = d.SupportsBrightness;
                 contrast.Enabled = d.SupportsContrast;
@@ -816,14 +1512,60 @@ namespace DisplayPresetPrototype
                 contrast.Maximum = (int)Math.Max(d.ContrastMax, d.ContrastMin + 1);
                 contrast.Value = Clamp((int)d.ContrastCurrent, contrast.Minimum, contrast.Maximum);
                 contrastValue.Text = d.SupportsContrast ? contrast.Value.ToString() : "不支持";
-                saturation.Enabled = d.SupportsSaturation;
-                saturation.Visible = d.SupportsSaturation;
-                saturationHint.Visible = !d.SupportsSaturation;
-                saturation.Minimum = (int)Math.Min(d.SaturationMin, 100);
-                saturation.Maximum = (int)Math.Max(d.SaturationMax, d.SaturationMin + 1);
-                saturation.Value = Clamp((int)d.SaturationCurrent, saturation.Minimum, saturation.Maximum);
-                saturationValue.Text = d.SupportsSaturation ? saturation.Value.ToString() : "";
-                saturationValue.Visible = d.SupportsSaturation;
+                int requestedBackend = appSettings.SaturationBackend;
+                bool hardwareSelected = requestedBackend == 1;
+                bool softwareSelected = requestedBackend == 2;
+                bool useHardware = !softwareSelected && d.SupportsSaturation;
+                bool useSoftware = softwareSelected ||
+                    (requestedBackend == 0 && !d.SupportsSaturation);
+                usingSoftwareSaturation = useSoftware;
+                if (useHardware)
+                {
+                    if (softwareSaturation.Value != 100)
+                        softwareSaturation.Restore();
+                    saturationTitle.Text = "饱和度";
+                    saturation.Minimum = (int)Math.Min(d.SaturationMin, 100);
+                    saturation.Maximum = (int)Math.Max(d.SaturationMax, d.SaturationMin + 1);
+                    saturation.Value = Clamp((int)d.SaturationCurrent,
+                        saturation.Minimum, saturation.Maximum);
+                    saturationHint.Visible = false;
+                }
+                else if (useSoftware)
+                {
+                    saturationTitle.Text = "饱和度";
+                    saturation.Minimum = 0;
+                    saturation.Maximum = 200;
+                    saturation.Value = softwareSaturation.Value;
+                    saturationHint.Text = softwareSaturation.IsAvailable
+                        ? "⚠ 软件饱和度可能与 DLSS FG、AFMF 或第三方插帧冲突。\r\n开启游戏性能保护后，全屏游戏期间会自动暂停。"
+                        : "当前 Windows 环境不支持全屏颜色矩阵";
+                    saturationHint.Visible = !softwareSaturation.IsAvailable;
+                }
+                else
+                {
+                    saturationTitle.Text = "饱和度";
+                    saturation.Minimum = 0;
+                    saturation.Maximum = 200;
+                    saturation.Value = 100;
+                    saturationHint.Text = hardwareSelected
+                        ? "此显示器不支持 DDC/CI 饱和度，请改用自动或 Windows 软件色彩"
+                        : "当前饱和度后端不可用";
+                    saturationHint.Visible = true;
+                }
+                bool saturationAvailable = useHardware ||
+                    (useSoftware && softwareSaturation.IsAvailable);
+                saturation.Enabled = saturationAvailable;
+                // Preserve the row geometry when a backend is unavailable.
+                // Hiding controls makes TableLayoutPanel collapse/reflow the
+                // row and moves the selector and following content.
+                saturation.Visible = true;
+                saturationValue.Text = saturationAvailable
+                    ? saturation.Value.ToString() : "不可用";
+                saturationValue.Visible = true;
+                saturationHint.Visible = useSoftware || !saturationAvailable;
+                saturationHint.ForeColor = useSoftware && softwareSaturation.IsAvailable
+                    ? Color.FromArgb(194, 104, 42) : Muted;
+                saturationHint.BringToFront();
 
                 if (!startup.ContainsKey(d.Id))
                     startup[d.Id] = Snapshot.From(d);
@@ -856,11 +1598,17 @@ namespace DisplayPresetPrototype
                     results.Add("对比度");
                     Thread.Sleep(80);
                 }
-                if (d.SupportsSaturation)
+                if (!usingSoftwareSaturation && d.SupportsSaturation)
                 {
                     d.SetSaturation((uint)saturation.Value);
                     results.Add("饱和度");
                     Thread.Sleep(80);
+                }
+                else if (softwareSaturation.IsAvailable)
+                {
+                    if (ApplySoftwareSaturationSafely(saturation.Value))
+                        results.Add("软件饱和度");
+                    else results.Add("软件饱和度（游戏性能保护已拦截）");
                 }
                 d.Refresh();
                 SetStatus(results.Count == 0 ? "当前显示器没有可调项目。" : "已应用：" + string.Join("、", results), results.Count == 0);
@@ -906,6 +1654,8 @@ namespace DisplayPresetPrototype
                     uint requestedBrightness = (uint)brightness.Value;
                     uint requestedContrast = (uint)contrast.Value;
                     uint requestedSaturation = (uint)saturation.Value;
+                    bool applySoftwareSaturation = doSaturation &&
+                        usingSoftwareSaturation && softwareSaturation.IsAvailable;
                     pendingBrightness = false;
                     pendingContrast = false;
                     pendingSaturation = false;
@@ -927,7 +1677,7 @@ namespace DisplayPresetPrototype
                                 d.SetContrast(requestedContrast);
                                 changed.Add("对比度 " + d.ContrastCurrent);
                             }
-                            if (doSaturation && d.SupportsSaturation)
+                            if (doSaturation && !usingSoftwareSaturation && d.SupportsSaturation)
                             {
                                 d.SetSaturation(requestedSaturation);
                                 changed.Add("饱和度 " + d.SaturationCurrent);
@@ -940,6 +1690,18 @@ namespace DisplayPresetPrototype
                     });
 
                     if (closing) break;
+                    if (failure == null && applySoftwareSaturation)
+                    {
+                        try
+                        {
+                            bool applied = ApplySoftwareSaturationSafely(
+                                (int)requestedSaturation);
+                            result = applied
+                                ? "实时应用：软件饱和度 " + requestedSaturation
+                                : "游戏性能保护：全屏期间不启用软件饱和度。";
+                        }
+                        catch (Exception ex) { failure = ex; }
+                    }
                     if (failure != null)
                         SetStatus("实时应用失败：" + failure.Message, true);
                     else
@@ -969,6 +1731,12 @@ namespace DisplayPresetPrototype
             pendingSaturation = false;
             // Give immediate visual feedback. Hardware DDC/CI restoration and
             // verification continue in the background and can take seconds.
+            if (usingSoftwareSaturation)
+            {
+                try { softwareSaturation.Restore(); } catch { }
+                saturation.Value = 100;
+                saturationValue.Text = "100";
+            }
             SyncControlsToSnapshot(snapshot);
             SetStatus("滑块已重置，正在后台恢复显示器硬件参数…", false);
             try
@@ -1009,6 +1777,11 @@ namespace DisplayPresetPrototype
             {
                 saturation.Value = Clamp((int)snapshot.Saturation, saturation.Minimum, saturation.Maximum);
                 saturationValue.Text = saturation.Value.ToString();
+            }
+            else if (usingSoftwareSaturation && saturation.Enabled)
+            {
+                saturation.Value = 100;
+                saturationValue.Text = "100";
             }
         }
 
@@ -1106,6 +1879,7 @@ namespace DisplayPresetPrototype
         {
             UpdateStyleValueLabel(slider, percent);
             UpdateStyleRiskStatus();
+            UpdateLiveToneCurve();
             if (settingStyleControls) return;
             stylePreviewTimer.Stop();
             if (applyImmediately) ApplyStylePreview();
@@ -1260,6 +2034,56 @@ namespace DisplayPresetPrototype
             foreach (var pair in styleValueLabels)
                 UpdateStyleValueLabel(pair.Key,
                     pair.Key == styleShadows || pair.Key == styleHighlights);
+            UpdateLiveToneCurve();
+        }
+
+        private void UpdateLiveToneCurve()
+        {
+            liveToneCurve.Shadows = GammaRampController.ScalePositive(styleShadows.Value, 200);
+            liveToneCurve.Highlights = GammaRampController.ScalePositive(styleHighlights.Value, 200);
+            liveToneCurve.Midtones = GammaRampController.ScaleSigned(styleMidtones.Value);
+            liveToneCurve.BlackPoint = GammaRampController.ScaleSigned(styleBlackPoint.Value);
+            liveToneCurve.WhitePoint = GammaRampController.ScaleSigned(styleWhitePoint.Value);
+            liveToneCurve.ContrastPivot = GammaRampController.ScaleSigned(styleContrastPivot.Value);
+            liveToneCurve.Vibrance = GammaRampController.ScaleSigned(styleVibrance.Value);
+            liveToneCurve.Exposure = GammaRampController.ScaleSigned(styleExposure.Value);
+            liveToneCurve.ShadowRange = GammaRampController.ScaleSigned(styleShadowRange.Value);
+            liveToneCurve.HighlightRange = GammaRampController.ScaleSigned(styleHighlightRange.Value);
+            liveToneCurve.TransitionSoftness =
+                GammaRampController.ScaleSigned(styleTransitionSoftness.Value);
+            liveToneCurve.Invalidate();
+        }
+
+        private void ExportCurrentLut()
+        {
+            string presetName = activeStyle == null ? "ShadePilot-current" : activeStyle.Name;
+            foreach (char invalid in Path.GetInvalidFileNameChars())
+                presetName = presetName.Replace(invalid, '_');
+            using (var dialog = new SaveFileDialog {
+                Title = "导出供 OBS 使用的 3D LUT",
+                Filter = "Adobe Cube 3D LUT (*.cube)|*.cube",
+                FileName = presetName + ".cube",
+                AddExtension = true,
+                DefaultExt = "cube"
+            })
+            {
+                if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                try
+                {
+                    CubeLutExporter.Export(dialog.FileName, 33,
+                        styleShadows.Value, styleHighlights.Value, styleMidtones.Value,
+                        styleBlackPoint.Value, styleWhitePoint.Value,
+                        styleContrastPivot.Value, styleTemperature.Value,
+                        styleTint.Value, styleVibrance.Value, saturation.Value,
+                        styleExposure.Value, styleShadowRange.Value,
+                        styleHighlightRange.Value, styleTransitionSoftness.Value);
+                    SetStatus("OBS LUT 已导出。请在来源或场景的“应用 LUT”滤镜中选择该文件。", false);
+                }
+                catch (Exception ex)
+                {
+                    SetStatus("LUT 导出失败：" + ex.Message, true);
+                }
+            }
         }
 
         private static string FormatStyleValue(int value, bool percent)
@@ -1296,6 +2120,7 @@ namespace DisplayPresetPrototype
             existing.Temperature = styleTemperature.Value;
             existing.Tint = styleTint.Value;
             existing.Vibrance = styleVibrance.Value;
+            existing.Saturation = saturation.Value;
             existing.Exposure = styleExposure.Value;
             existing.ShadowRange = styleShadowRange.Value;
             existing.HighlightRange = styleHighlightRange.Value;
@@ -1332,6 +2157,226 @@ namespace DisplayPresetPrototype
             SetStatus("快捷键设置已保存并重新注册。", false);
         }
 
+        private void OpenToolsCenter()
+        {
+            using (var dialog = new ToolsCenterForm(
+                styleStore, appSettings,
+                delegate { temporaryA = CaptureCurrentStyle("临时 A"); },
+                delegate { temporaryB = CaptureCurrentStyle("临时 B"); },
+                delegate(bool useA) {
+                    var preset = useA ? temporaryA : temporaryB;
+                    if (preset != null) ApplyStylePreset(preset);
+                },
+                BuildEnvironmentDiagnosis))
+            {
+                dialog.SettingsChanged += delegate {
+                    styleStore.Save();
+                    appSettings.Save();
+                    lastAutoProcess = "";
+                    RegisterGlobalHotkeys();
+                    UpdateGameRuleTimer();
+                };
+                dialog.ShowDialog(this);
+            }
+            ReloadStylePresets(stylePresetBox.SelectedItem as StylePresetData);
+            RegisterGlobalHotkeys();
+        }
+
+        private StylePresetData CaptureCurrentStyle(string name)
+        {
+            return new StylePresetData {
+                Name = name,
+                Shadows = styleShadows.Value,
+                Highlights = styleHighlights.Value,
+                Midtones = styleMidtones.Value,
+                BlackPoint = styleBlackPoint.Value,
+                WhitePoint = styleWhitePoint.Value,
+                ContrastPivot = styleContrastPivot.Value,
+                Temperature = styleTemperature.Value,
+                Tint = styleTint.Value,
+                Vibrance = styleVibrance.Value,
+                Saturation = saturation.Value,
+                Exposure = styleExposure.Value,
+                ShadowRange = styleShadowRange.Value,
+                HighlightRange = styleHighlightRange.Value,
+                TransitionSoftness = styleTransitionSoftness.Value
+            };
+        }
+
+        private void ToggleOriginalView()
+        {
+            if (!originalToggleActive)
+            {
+                styleBeforeOriginalToggle = CaptureCurrentStyle("切换原画前");
+                try { gammaController.RestoreAll(); } catch { }
+                try { softwareSaturation.Restore(); } catch { }
+                originalToggleActive = true;
+                SetStatus("当前为原画；再次按快捷键恢复滤镜。", false);
+            }
+            else
+            {
+                originalToggleActive = false;
+                if (styleBeforeOriginalToggle != null)
+                    ApplyStylePreset(styleBeforeOriginalToggle);
+                SetStatus("已恢复切换原画前的画面。", false);
+            }
+        }
+
+        private void CheckGameAutoSwitch()
+        {
+            string processName = "";
+            IntPtr foreground = IntPtr.Zero;
+            uint processId = 0;
+            try
+            {
+                foreground = MonitorApi.GetForegroundWindow();
+                MonitorApi.GetWindowThreadProcessId(foreground, out processId);
+                using (var process = Process.GetProcessById((int)processId))
+                    processName = process.ProcessName;
+            }
+            catch { return; }
+            bool protect = appSettings.FrameGenerationCompatibility &&
+                MonitorApi.IsFullscreenWindow(foreground) &&
+                processId != (uint)currentProcessId &&
+                !string.Equals(processName, "explorer", StringComparison.OrdinalIgnoreCase) &&
+                !string.Equals(processName, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase);
+            UpdatePerformanceProtection(protect);
+            if (!appSettings.GameAutoSwitchEnabled ||
+                appSettings.GameRules == null || originalToggleActive) return;
+            if (string.Equals(processName, lastAutoProcess,
+                StringComparison.OrdinalIgnoreCase)) return;
+            lastAutoProcess = processName;
+            var rule = appSettings.GameRules.Find(item =>
+                string.Equals(NormalizeProcessName(item.ProcessName),
+                    NormalizeProcessName(processName), StringComparison.OrdinalIgnoreCase));
+            if (rule == null)
+            {
+                if (autoSwitchActive)
+                {
+                    softwareSaturationSuppressedForGame = performanceProtectionActive;
+                    if (appSettings.RestoreAfterGame)
+                    {
+                        if (styleBeforeAutoSwitch != null)
+                            ApplyStylePreset(styleBeforeAutoSwitch);
+                        else RestoreStyle();
+                    }
+                    else ApplyPresetSaturation();
+                    autoSwitchActive = false;
+                    styleBeforeAutoSwitch = null;
+                    SetStatus(appSettings.RestoreAfterGame
+                        ? "游戏离开前台，已恢复进入前的画面。"
+                        : "游戏离开前台，已恢复软件饱和度。", false);
+                }
+                return;
+            }
+            var preset = styleStore.Items.Find(item =>
+                string.Equals(item.Name, rule.PresetName, StringComparison.OrdinalIgnoreCase));
+            if (preset == null) return;
+            if (!autoSwitchActive)
+                styleBeforeAutoSwitch = activeStyle == null
+                    ? CaptureCurrentStyle("自动切换前") : activeStyle;
+            softwareSaturationSuppressedForGame = performanceProtectionActive;
+            ApplyStylePreset(preset);
+            autoSwitchActive = true;
+            SetStatus("自动切换：" + processName + " → " + preset.Name +
+                (softwareSaturationSuppressedForGame ? " · 已暂停软件饱和度" : ""), false);
+        }
+
+        private void UpdateGameRuleTimer()
+        {
+            gameRuleTimer.Stop();
+            if (!closing && (appSettings.GameAutoSwitchEnabled ||
+                appSettings.FrameGenerationCompatibility))
+                gameRuleTimer.Start();
+            else if (autoSwitchActive)
+            {
+                softwareSaturationSuppressedForGame = false;
+                if (appSettings.RestoreAfterGame && styleBeforeAutoSwitch != null)
+                    ApplyStylePreset(styleBeforeAutoSwitch);
+                else ApplyPresetSaturation();
+                autoSwitchActive = false;
+                styleBeforeAutoSwitch = null;
+            }
+            if (!appSettings.FrameGenerationCompatibility)
+                UpdatePerformanceProtection(false);
+        }
+
+        private void UpdatePerformanceProtection(bool shouldProtect)
+        {
+            if (shouldProtect == performanceProtectionActive) return;
+            performanceProtectionActive = shouldProtect;
+            softwareSaturationSuppressedForGame = shouldProtect;
+            if (shouldProtect)
+            {
+                recoveryTimer.Stop();
+                try { softwareSaturation.Restore(); } catch { }
+                SetStatus("游戏性能保护已启用：软件色彩矩阵与显示器重检已暂停。", false);
+                return;
+            }
+
+            try { ApplyPresetSaturation(); } catch { }
+            if (displayRecoveryDeferredForGame)
+            {
+                displayRecoveryDeferredForGame = false;
+                recoveryTimer.Stop();
+                recoveryTimer.Start();
+            }
+            SetStatus("已离开全屏程序，ShadePilot 后台功能已恢复。", false);
+        }
+
+        private static string NormalizeProcessName(string name)
+        {
+            if (string.IsNullOrWhiteSpace(name)) return "";
+            name = name.Trim();
+            return name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase)
+                ? name.Substring(0, name.Length - 4) : name;
+        }
+
+        private string BuildEnvironmentDiagnosis()
+        {
+            var d = Selected;
+            var lines = new List<string>();
+            lines.Add("系统：" + Environment.OSVersion.VersionString);
+            lines.Add("HDR / 高级颜色：" + (MonitorApi.IsAdvancedColorEnabled()
+                ? "已开启，Gamma 或颜色矩阵可能受限" : "未检测到开启"));
+            lines.Add("Gamma Ramp：" + (gammaController.IsCaptured
+                ? "已捕获且可写入" : "尚未写入测试"));
+            lines.Add("Gamma 基线：" + (gammaController.IsUsingCompatibilityBaseline
+                ? "驱动拒绝回读，正在使用标准兼容基线" : "驱动回读基线"));
+            lines.Add("软件颜色矩阵：" + (softwareSaturation.IsAvailable
+                ? "可用" : "不可用或被系统放大镜占用"));
+            lines.Add("软件颜色运行时：" + (softwareSaturation.IsActive
+                ? "活动（可能与帧生成冲突）" : "未启动"));
+            lines.Add("游戏性能保护：" + (performanceProtectionActive
+                ? "活动，已暂停软件矩阵与显示器重检"
+                : (appSettings.FrameGenerationCompatibility ? "待命" : "已关闭")));
+            lines.Add("游戏期间延迟的显示恢复：" +
+                (displayRecoveryDeferredForGame ? "有" : "无"));
+            lines.Add("当前显示器：" + (d == null ? "未检测到" : d.Name));
+            if (d != null)
+            {
+                lines.Add("DDC/CI 亮度：" + (d.SupportsBrightness ? "支持" : "不支持"));
+                lines.Add("DDC/CI 对比度：" + (d.SupportsContrast ? "支持" : "不支持"));
+                lines.Add("DDC/CI 饱和度：" + (d.SupportsSaturation ? "支持" : "不支持"));
+                lines.Add("画面风格目标：" +
+                    (string.IsNullOrWhiteSpace(d.DisplayDeviceName)
+                        ? "默认桌面（未取得设备名）" : d.DisplayDeviceName));
+                lines.Add("输出显卡：" + (string.IsNullOrWhiteSpace(d.DisplayAdapterName)
+                    ? "未识别" : d.DisplayAdapterName));
+            }
+            lines.Add("已注册全局快捷键：" + registeredHotkeyCount);
+            lines.Add("已收到快捷键事件：" + hotkeyReceivedCount);
+            lines.Add("最近快捷键：" + lastHotkeyAction +
+                (lastHotkeyReceivedUtc == DateTime.MinValue ? "" :
+                    " · " + lastHotkeyReceivedUtc.ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss")));
+            lines.Add("最近画面风格错误：" + lastStyleApplyError);
+            lines.Add("当前预设：" + (activeStyle == null ? "手动参数 / 原画" : activeStyle.Name));
+            lines.Add("自动切换：" + (appSettings.GameAutoSwitchEnabled ? "已开启" : "已关闭"));
+            lines.Add("快捷键切换原画：" +
+                (appSettings.HoldOriginalKey == 0 ? "未设置" : "已设置"));
+            return string.Join(Environment.NewLine, lines.ToArray());
+        }
+
         private void ManageStylePresets()
         {
             var selected = stylePresetBox.SelectedItem as StylePresetData;
@@ -1353,6 +2398,9 @@ namespace DisplayPresetPrototype
                 preset.Temperature, preset.Tint, preset.Vibrance,
                 preset.Exposure, preset.ShadowRange, preset.HighlightRange,
                 preset.TransitionSoftness);
+            saturation.Value = Clamp(preset.Saturation <= 0 ? 100 : preset.Saturation,
+                saturation.Minimum, saturation.Maximum);
+            saturationValue.Text = saturation.Value.ToString();
         }
 
         private void SetStyleControls(
@@ -1399,24 +2447,66 @@ namespace DisplayPresetPrototype
             try
             {
                 activeStyle = null;
-                if (!gammaController.IsCaptured) gammaController.CaptureOriginal();
-                gammaController.Apply(
-                    styleShadows.Value, styleHighlights.Value,
-                    styleMidtones.Value, styleBlackPoint.Value, styleWhitePoint.Value,
-                    styleContrastPivot.Value, styleTemperature.Value,
-                    styleTint.Value, styleVibrance.Value, styleExposure.Value,
-                    styleShadowRange.Value, styleHighlightRange.Value,
-                    styleTransitionSoftness.Value);
+                var targets = GetStyleTargetDeviceNames();
+                var failures = new List<string>();
+                foreach (string target in targets)
+                {
+                    try
+                    {
+                        gammaController.SetTarget(target);
+                        gammaController.Apply(
+                            styleShadows.Value, styleHighlights.Value,
+                            styleMidtones.Value, styleBlackPoint.Value, styleWhitePoint.Value,
+                            styleContrastPivot.Value, styleTemperature.Value,
+                            styleTint.Value, styleVibrance.Value, styleExposure.Value,
+                            styleShadowRange.Value, styleHighlightRange.Value,
+                            styleTransitionSoftness.Value);
+                    }
+                    catch (Exception ex) { failures.Add((target ?? "默认桌面") + "：" + ex.Message); }
+                }
+                RestoreGammaTargetToSelection();
+                if (failures.Count == targets.Count)
+                    throw new InvalidOperationException(string.Join("；", failures.ToArray()));
+                ApplyPresetSaturation();
+                lastStyleApplyError = "无";
                 SetStatus(
-                    "画面风格已应用 · 暗部 " + FormatStyleValue(styleShadows.Value, true) +
+                    (syncAllDisplays.Checked ? "画面风格已同步" : "画面风格已应用") +
+                    (failures.Count > 0 ? "（部分屏幕失败）" : "") + " · 暗部 " + FormatStyleValue(styleShadows.Value, true) +
                     " · 高光 " + FormatStyleValue(styleHighlights.Value, true) +
                     " · 色温 " + FormatStyleValue(styleTemperature.Value, false) +
                     " · 色调 " + FormatStyleValue(styleTint.Value, false), false);
             }
             catch (Exception ex)
             {
+                lastStyleApplyError = ex.Message;
                 SetStatus("画面风格应用失败：" + ex.Message, true);
             }
+        }
+
+        private void ApplyPresetSaturation()
+        {
+            var d = Selected;
+            if (d != null && !usingSoftwareSaturation && d.SupportsSaturation)
+                d.SetSaturation((uint)saturation.Value);
+            else if (usingSoftwareSaturation && softwareSaturation.IsAvailable)
+            {
+                if (softwareSaturationSuppressedForGame)
+                    softwareSaturation.Restore();
+                else ApplySoftwareSaturationSafely(saturation.Value);
+            }
+        }
+
+        private bool ApplySoftwareSaturationSafely(int value)
+        {
+            if (appSettings.FrameGenerationCompatibility &&
+                MonitorApi.IsFullscreenWindow(MonitorApi.GetForegroundWindow()))
+            {
+                UpdatePerformanceProtection(true);
+                try { softwareSaturation.Restore(); } catch { }
+                return false;
+            }
+            softwareSaturation.Apply(value);
+            return true;
         }
 
         private void RestoreStyle()
@@ -1424,9 +2514,14 @@ namespace DisplayPresetPrototype
             try
             {
                 stylePreviewTimer.Stop();
-                gammaController.Restore();
+                if (syncAllDisplays.Checked) gammaController.RestoreAll();
+                else gammaController.Restore();
+                RestoreGammaTargetToSelection();
                 activeStyle = null;
                 SetStyleControls(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+                saturation.Value = Clamp(100, saturation.Minimum, saturation.Maximum);
+                saturationValue.Text = saturation.Value.ToString();
+                ApplyPresetSaturation();
                 SetStatus("已恢复程序启动前的原始画面。", false);
                 trayIcon.Text = "ShadePilot · 原始画面";
             }
@@ -1434,6 +2529,31 @@ namespace DisplayPresetPrototype
             {
                 SetStatus("恢复原始画面失败：" + ex.Message, true);
             }
+        }
+
+        private List<string> GetStyleTargetDeviceNames()
+        {
+            var result = new List<string>();
+            if (!syncAllDisplays.Checked)
+            {
+                result.Add(Selected == null ? null : Selected.DisplayDeviceName);
+                return result;
+            }
+            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            foreach (var display in displays)
+            {
+                string target = display.DisplayDeviceName;
+                string key = string.IsNullOrWhiteSpace(target) ? "__desktop__" : target;
+                if (seen.Add(key)) result.Add(target);
+            }
+            if (result.Count == 0) result.Add(null);
+            return result;
+        }
+
+        private void RestoreGammaTargetToSelection()
+        {
+            var selected = Selected;
+            gammaController.SetTarget(selected == null ? null : selected.DisplayDeviceName);
         }
 
         private void RegisterGlobalHotkeys()
@@ -1455,7 +2575,8 @@ namespace DisplayPresetPrototype
                 if (!MonitorApi.RegisterHotKey(Handle, id, modifiers, (uint)preset.HotkeyKey))
                 {
                     failed.Add(preset.Name);
-                    hotkeyRegistrationStatus[preset.Name] = "注册失败：可能被其他程序占用";
+                    hotkeyRegistrationStatus[preset.Name] = "注册失败，Win32 错误 " +
+                        Marshal.GetLastWin32Error();
                 }
                 else
                 {
@@ -1473,7 +2594,8 @@ namespace DisplayPresetPrototype
                     Handle, HotkeyRestore, restoreModifiers, (uint)styleStore.RestoreHotkeyKey))
                 {
                     failed.Add("恢复原始");
-                    hotkeyRegistrationStatus["恢复原始画面"] = "注册失败：可能被其他程序占用";
+                    hotkeyRegistrationStatus["恢复原始画面"] = "注册失败，Win32 错误 " +
+                        Marshal.GetLastWin32Error();
                 }
                 else {
                     hotkeysRegistered = true;
@@ -1482,6 +2604,45 @@ namespace DisplayPresetPrototype
                 }
             }
             else hotkeyRegistrationStatus["恢复原始画面"] = "未设置";
+
+            if (styleStore.CycleHotkeyKey != 0)
+            {
+                uint cycleModifiers = styleStore.CycleHotkeyModifiers | 0x4000u;
+                if (!MonitorApi.RegisterHotKey(
+                    Handle, HotkeyCycle, cycleModifiers, (uint)styleStore.CycleHotkeyKey))
+                {
+                    failed.Add("循环切换");
+                    hotkeyRegistrationStatus["循环切换所选预设"] =
+                        "注册失败，Win32 错误 " + Marshal.GetLastWin32Error();
+                }
+                else
+                {
+                    hotkeysRegistered = true;
+                    registeredHotkeyCount++;
+                    hotkeyRegistrationStatus["循环切换所选预设"] =
+                        "已注册，可在后台使用";
+                }
+            }
+            else hotkeyRegistrationStatus["循环切换所选预设"] = "未设置";
+
+            if (appSettings.HoldOriginalKey != 0)
+            {
+                uint toggleModifiers = appSettings.HoldOriginalModifiers | 0x4000u;
+                if (!MonitorApi.RegisterHotKey(Handle, HotkeyOriginalToggle,
+                    toggleModifiers, (uint)appSettings.HoldOriginalKey))
+                {
+                    failed.Add("切换原画");
+                    hotkeyRegistrationStatus["切换原画"] = "注册失败，Win32 错误 " +
+                        Marshal.GetLastWin32Error();
+                }
+                else
+                {
+                    hotkeysRegistered = true;
+                    registeredHotkeyCount++;
+                    hotkeyRegistrationStatus["切换原画"] = "已注册，可在后台使用";
+                }
+            }
+            else hotkeyRegistrationStatus["切换原画"] = "未设置";
 
             if (failed.Count == 0)
                 SetStatus("自定义后台快捷键已启用。", false);
@@ -1494,6 +2655,8 @@ namespace DisplayPresetPrototype
             foreach (int id in new List<int>(hotkeyMap.Keys))
                 MonitorApi.UnregisterHotKey(Handle, id);
             MonitorApi.UnregisterHotKey(Handle, HotkeyRestore);
+            MonitorApi.UnregisterHotKey(Handle, HotkeyCycle);
+            MonitorApi.UnregisterHotKey(Handle, HotkeyOriginalToggle);
             hotkeyMap.Clear();
             hotkeysRegistered = false;
         }
@@ -1503,13 +2666,51 @@ namespace DisplayPresetPrototype
             if (message.Msg == WmHotkey)
             {
                 int id = message.WParam.ToInt32();
+                hotkeyReceivedCount++;
+                lastHotkeyReceivedUtc = DateTime.UtcNow;
                 StylePresetData preset;
                 if (hotkeyMap.TryGetValue(id, out preset))
+                {
+                    lastHotkeyAction = "应用预设：" + preset.Name;
                     ApplyStylePreset(preset);
+                }
                 else if (id == HotkeyRestore)
+                {
+                    lastHotkeyAction = "恢复原始画面";
                     RestoreStyle();
+                }
+                else if (id == HotkeyCycle)
+                {
+                    lastHotkeyAction = "循环切换预设";
+                    CycleSelectedStyles();
+                }
+                else if (id == HotkeyOriginalToggle)
+                {
+                    lastHotkeyAction = "切换原画";
+                    ToggleOriginalView();
+                }
             }
             base.WndProc(ref message);
+            if (message.Msg == WmNcHitTest && WindowState == FormWindowState.Normal &&
+                message.Result.ToInt32() == 1)
+            {
+                int packed = message.LParam.ToInt32();
+                var point = PointToClient(new Point((short)(packed & 0xffff),
+                    (short)((packed >> 16) & 0xffff)));
+                int edge = Math.Max(6, DeviceDpi / 16);
+                bool left = point.X <= edge;
+                bool right = point.X >= ClientSize.Width - edge;
+                bool top = point.Y <= edge;
+                bool bottomEdge = point.Y >= ClientSize.Height - edge;
+                if (left && top) message.Result = new IntPtr(13);
+                else if (right && top) message.Result = new IntPtr(14);
+                else if (left && bottomEdge) message.Result = new IntPtr(16);
+                else if (right && bottomEdge) message.Result = new IntPtr(17);
+                else if (left) message.Result = new IntPtr(10);
+                else if (right) message.Result = new IntPtr(11);
+                else if (top) message.Result = new IntPtr(12);
+                else if (bottomEdge) message.Result = new IntPtr(15);
+            }
         }
 
         private void ApplyStylePreset(StylePresetData preset)
@@ -1520,6 +2721,33 @@ namespace DisplayPresetPrototype
             ApplyStylePreview();
             activeStyle = preset;
             trayIcon.Text = "ShadePilot · " + preset.Name;
+        }
+
+        private void CycleSelectedStyles()
+        {
+            var available = new List<StylePresetData>();
+            if (styleStore.CyclePresetNames != null)
+            {
+                foreach (string name in styleStore.CyclePresetNames)
+                {
+                    var preset = styleStore.Items.Find(item =>
+                        string.Equals(item.Name, name, StringComparison.OrdinalIgnoreCase));
+                    if (preset != null) available.Add(preset);
+                }
+            }
+            if (available.Count == 0)
+            {
+                SetStatus("循环切换没有可用预设，请在快捷键设置中至少勾选两个模式。", true);
+                return;
+            }
+            int activeIndex = activeStyle == null ? -1 :
+                available.FindIndex(item => item == activeStyle ||
+                    string.Equals(item.Name, activeStyle.Name, StringComparison.OrdinalIgnoreCase));
+            cyclePresetIndex = activeIndex >= 0 ? activeIndex : cyclePresetIndex;
+            cyclePresetIndex = (cyclePresetIndex + 1) % available.Count;
+            ApplyStylePreset(available[cyclePresetIndex]);
+            SetStatus("循环切换：" + available[cyclePresetIndex].Name +
+                "（" + (cyclePresetIndex + 1) + "/" + available.Count + "）", false);
         }
 
         private void ConfigureTrayIcon()
@@ -1574,7 +2802,16 @@ namespace DisplayPresetPrototype
         private void OnDisplayEnvironmentChanged(object sender, EventArgs e)
         {
             if (closing || !appSettings.AutoReapply) return;
+            if (appSettings.FrameGenerationCompatibility &&
+                (performanceProtectionActive ||
+                    MonitorApi.IsFullscreenWindow(MonitorApi.GetForegroundWindow())))
+            {
+                displayRecoveryDeferredForGame = true;
+                recoveryTimer.Stop();
+                return;
+            }
             recoveryTimer.Stop();
+            gameRuleTimer.Stop();
             recoveryTimer.Start();
         }
 
@@ -1641,13 +2878,16 @@ namespace DisplayPresetPrototype
             liveApplyTimer.Stop();
             stylePreviewTimer.Stop();
             recoveryTimer.Stop();
+            gameRuleTimer.Stop();
             SystemEvents.DisplaySettingsChanged -= OnDisplayEnvironmentChanged;
             SystemEvents.PowerModeChanged -= OnPowerModeChanged;
             pendingBrightness = pendingContrast = pendingSaturation = false;
             if (hotkeysRegistered) UnregisterGlobalHotkeys();
+            try { softwareSaturation.Restore(); } catch { }
             if (restoreOnExit.Checked)
             {
                 try { gammaController.Restore(); } catch { }
+                try { softwareSaturation.Restore(); } catch { }
                 foreach (var d in displays)
                 {
                     Snapshot s;
@@ -1660,8 +2900,119 @@ namespace DisplayPresetPrototype
             foreach (var d in displays) d.Dispose();
             trayIcon.Visible = false;
             trayIcon.Dispose();
+            softwareSaturation.Dispose();
         }
 
+    }
+
+    internal sealed class FullscreenColorController : IDisposable
+    {
+        private bool initialized;
+        private bool initializationFailed;
+        public bool IsAvailable { get { return !initializationFailed; } }
+        public bool IsActive { get { return initialized; } }
+        public int Value { get; private set; }
+
+        public FullscreenColorController()
+        {
+            Value = 100;
+        }
+
+        public void Apply(int value)
+        {
+            value = Math.Max(0, Math.Min(200, value));
+            if (value == 100)
+            {
+                Deactivate();
+                return;
+            }
+            EnsureInitialized();
+            float saturation = value / 100F;
+            const float red = 0.2126F;
+            const float green = 0.7152F;
+            const float blue = 0.0722F;
+            float inverse = 1F - saturation;
+            var matrix = new float[] {
+                inverse * red + saturation, inverse * red, inverse * red, 0, 0,
+                inverse * green, inverse * green + saturation, inverse * green, 0, 0,
+                inverse * blue, inverse * blue, inverse * blue + saturation, 0, 0,
+                0, 0, 0, 1, 0,
+                0, 0, 0, 0, 1
+            };
+            var effect = new MagnificationApi.MagColorEffect { Transform = matrix };
+            if (!MagnificationApi.MagSetFullscreenColorEffect(ref effect))
+            {
+                Deactivate();
+                throw new InvalidOperationException(
+                    "Windows 拒绝应用全屏颜色矩阵；HDR、放大镜或当前显示模式可能不兼容。");
+            }
+            Value = value;
+        }
+
+        public void Restore()
+        {
+            Deactivate();
+        }
+
+        private void EnsureInitialized()
+        {
+            if (initialized) return;
+            try { initialized = MagnificationApi.MagInitialize(); }
+            catch { initialized = false; }
+            if (!initialized)
+            {
+                initializationFailed = true;
+                throw new InvalidOperationException(
+                    "Windows 全屏颜色矩阵不可用。请确认系统放大镜未占用该功能。");
+            }
+        }
+
+        private void Deactivate()
+        {
+            Value = 100;
+            if (!initialized) return;
+            try
+            {
+                var identity = new MagnificationApi.MagColorEffect {
+                    Transform = new float[] {
+                        1,0,0,0,0, 0,1,0,0,0, 0,0,1,0,0,
+                        0,0,0,1,0, 0,0,0,0,1
+                    }
+                };
+                MagnificationApi.MagSetFullscreenColorEffect(ref identity);
+            }
+            catch { }
+            finally
+            {
+                try { MagnificationApi.MagUninitialize(); } catch { }
+                initialized = false;
+            }
+        }
+
+        public void Dispose() { Deactivate(); }
+    }
+
+    internal static class MagnificationApi
+    {
+        [StructLayout(LayoutKind.Sequential)]
+        internal struct MagColorEffect
+        {
+            [MarshalAs(UnmanagedType.ByValArray, SizeConst = 25)]
+            public float[] Transform;
+        }
+
+        [DllImport("Magnification.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool MagInitialize();
+
+        [DllImport("Magnification.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool MagUninitialize();
+
+        [DllImport("Magnification.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        internal static extern bool MagSetFullscreenColorEffect(
+            ref MagColorEffect effect);
     }
 
     internal static class VectorUiPath
@@ -1684,11 +3035,22 @@ namespace DisplayPresetPrototype
         private const int WmPaint = 0x000F;
         private const int WmNcPaint = 0x0085;
         public Color BorderColor { get; set; }
+        private bool hovered;
 
         public ThemedComboBox()
         {
             BorderColor = Color.White;
             FlatStyle = FlatStyle.Flat;
+        }
+
+        protected override void OnMouseEnter(EventArgs e)
+        {
+            hovered = true; Invalidate(); base.OnMouseEnter(e);
+        }
+
+        protected override void OnMouseLeave(EventArgs e)
+        {
+            hovered = false; Invalidate(); base.OnMouseLeave(e);
         }
 
         protected override void WndProc(ref Message m)
@@ -1698,7 +3060,8 @@ namespace DisplayPresetPrototype
                 return;
 
             using (var graphics = Graphics.FromHwnd(Handle))
-            using (var pen = new Pen(BorderColor, 2F))
+            using (var pen = new Pen((Focused || hovered)
+                ? ControlPaint.Dark(BorderColor, 0.08F) : BorderColor, 1F))
                 graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
         }
     }
@@ -1730,6 +3093,39 @@ namespace DisplayPresetPrototype
                 new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1)), CornerRadius))
             using (var brush = new SolidBrush(FillColor))
                 e.Graphics.FillPath(brush, path);
+        }
+    }
+
+    internal sealed class RoundedFlowLayoutPanel : FlowLayoutPanel
+    {
+        public Color FillColor { get; set; }
+        public Color BorderColor { get; set; }
+        public int CornerRadius { get; set; }
+
+        public RoundedFlowLayoutPanel()
+        {
+            FillColor = Color.White;
+            BorderColor = Color.FromArgb(225, 220, 214);
+            CornerRadius = 12;
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                     ControlStyles.OptimizedDoubleBuffer | ControlStyles.SupportsTransparentBackColor |
+                     ControlStyles.ResizeRedraw, true);
+            BackColor = Color.Transparent;
+        }
+
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+            e.Graphics.Clear(Parent == null ? FillColor : Parent.BackColor);
+            using (var path = VectorUiPath.Rounded(
+                new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1)), CornerRadius))
+            using (var brush = new SolidBrush(FillColor))
+            using (var pen = new Pen(BorderColor, 1F))
+            {
+                e.Graphics.FillPath(brush, path);
+                e.Graphics.DrawPath(pen, path);
+            }
         }
     }
 
@@ -1766,9 +3162,13 @@ namespace DisplayPresetPrototype
                 new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1)), CornerRadius))
             using (var brush = new SolidBrush(fill))
                 e.Graphics.FillPath(brush, path);
+            TextFormatFlags alignment = TextAlign == ContentAlignment.MiddleLeft
+                ? TextFormatFlags.Left : TextFormatFlags.HorizontalCenter;
+            var textBounds = new Rectangle(Padding.Left, 0,
+                Math.Max(1, Width - Padding.Horizontal), Height);
             TextRenderer.DrawText(
-                e.Graphics, Text, Font, ClientRectangle, ForeColor,
-                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter |
+                e.Graphics, Text, Font, textBounds, ForeColor,
+                alignment | TextFormatFlags.VerticalCenter |
                 TextFormatFlags.SingleLine | TextFormatFlags.NoPadding);
         }
     }
@@ -1804,53 +3204,28 @@ namespace DisplayPresetPrototype
     {
         protected override void OnMouseWheel(MouseEventArgs e)
         {
-            // Intentionally consume the wheel input. Accidental scrolling over a
-            // focused slider must scroll the page, not change display settings.
+            // Do not change the slider accidentally. Forward the wheel to the
+            // nearest adaptive scroll container so scrolling remains smooth
+            // even while the pointer is above a parameter track.
             var handled = e as HandledMouseEventArgs;
             if (handled != null) handled.Handled = true;
-        }
-    }
-
-    internal sealed class CurvePreviewForm : Form
-    {
-        public CurvePreviewForm(
-            int shadows, int highlights, int midtones,
-            int blackPoint, int whitePoint, int contrastPivot, int vibrance,
-            int exposure, int shadowRange, int highlightRange, int transitionSoftness)
-        {
-            Text = "当前明暗曲线";
-            ClientSize = new Size(520, 430);
-            StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            BackColor = Color.FromArgb(245, 247, 251);
-            Font = new Font("Microsoft YaHei UI", 9F);
-            Controls.Add(new Label {
-                Text = "输入亮度 → 输出亮度", AutoSize = true,
-                Location = new Point(28, 22),
-                Font = new Font(Font.FontFamily, 13F, FontStyle.Bold),
-                ForeColor = Color.FromArgb(29, 36, 50)
-            });
-            Controls.Add(new Label {
-                Text = "灰色虚线为原始线；紫色曲线为当前参数结果",
-                AutoSize = true, Location = new Point(30, 54),
-                ForeColor = Color.FromArgb(104, 113, 130)
-            });
-            Controls.Add(new ToneCurveGraph {
-                Location = new Point(30, 84), Size = new Size(460, 300),
-                Shadows = GammaRampController.ScalePositive(shadows, 200),
-                Highlights = GammaRampController.ScalePositive(highlights, 200),
-                Midtones = GammaRampController.ScaleSigned(midtones),
-                BlackPoint = GammaRampController.ScaleSigned(blackPoint),
-                WhitePoint = GammaRampController.ScaleSigned(whitePoint),
-                ContrastPivot = GammaRampController.ScaleSigned(contrastPivot),
-                Vibrance = GammaRampController.ScaleSigned(vibrance),
-                Exposure = GammaRampController.ScaleSigned(exposure),
-                ShadowRange = GammaRampController.ScaleSigned(shadowRange),
-                HighlightRange = GammaRampController.ScaleSigned(highlightRange),
-                TransitionSoftness = GammaRampController.ScaleSigned(transitionSoftness)
-            });
+            Control current = Parent;
+            while (current != null)
+            {
+                var scroll = current as ScrollableControl;
+                if (scroll != null && scroll.AutoScroll && scroll.VerticalScroll.Visible)
+                {
+                    int step = Math.Max(48, scroll.ClientSize.Height / 7);
+                    int maximum = Math.Max(scroll.VerticalScroll.Minimum,
+                        scroll.VerticalScroll.Maximum - scroll.VerticalScroll.LargeChange + 1);
+                    int target = scroll.VerticalScroll.Value - Math.Sign(e.Delta) * step;
+                    scroll.VerticalScroll.Value = Math.Max(scroll.VerticalScroll.Minimum,
+                        Math.Min(maximum, target));
+                    scroll.PerformLayout();
+                    break;
+                }
+                current = current.Parent;
+            }
         }
     }
 
@@ -1862,7 +3237,7 @@ namespace DisplayPresetPrototype
         public ToneCurveGraph()
         {
             DoubleBuffered = true;
-            BackColor = Color.White;
+            BackColor = ThemeManager.Current.Surface;
         }
 
         protected override void OnPaint(PaintEventArgs e)
@@ -1870,7 +3245,8 @@ namespace DisplayPresetPrototype
             base.OnPaint(e);
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             var area = new Rectangle(18, 14, Width - 36, Height - 32);
-            using (var grid = new Pen(Color.FromArgb(228, 231, 238), 1F))
+            AppTheme theme = ThemeManager.Current;
+            using (var grid = new Pen(theme.Button, 1F))
             {
                 for (int i = 0; i <= 4; i++)
                 {
@@ -1880,7 +3256,7 @@ namespace DisplayPresetPrototype
                     e.Graphics.DrawLine(grid, area.Left, y, area.Right, y);
                 }
             }
-            using (var original = new Pen(Color.FromArgb(165, 170, 180), 1.5F)) {
+            using (var original = new Pen(theme.Muted, 1.5F)) {
                 original.DashStyle = DashStyle.Dash;
                 e.Graphics.DrawLine(original, area.Left, area.Bottom, area.Right, area.Top);
             }
@@ -2124,23 +3500,235 @@ namespace DisplayPresetPrototype
         }
     }
 
+    internal static class CubeLutExporter
+    {
+        public static void Export(
+            string path, int size, int shadows, int highlights, int midtones,
+            int blackPoint, int whitePoint, int contrastPivot,
+            int temperature, int tint, int vibrance, int saturation,
+            int exposure, int shadowRange, int highlightRange,
+            int transitionSoftness)
+        {
+            size = Math.Max(17, Math.Min(65, size));
+            double shadow = GammaRampController.ScalePositive(shadows, 200);
+            double highlight = GammaRampController.ScalePositive(highlights, 200);
+            double midtone = GammaRampController.ScaleSigned(midtones);
+            double black = GammaRampController.ScaleSigned(blackPoint);
+            double white = GammaRampController.ScaleSigned(whitePoint);
+            double pivot = GammaRampController.ScaleSigned(contrastPivot);
+            double color = GammaRampController.ScaleSigned(vibrance);
+            double exp = GammaRampController.ScaleSigned(exposure);
+            double shadowCoverage = GammaRampController.ScaleSigned(shadowRange);
+            double highlightCoverage = GammaRampController.ScaleSigned(highlightRange);
+            double softness = GammaRampController.ScaleSigned(transitionSoftness);
+            double warmth = GammaRampController.ScaleSigned(temperature);
+            double tintAmount = GammaRampController.ScaleSigned(tint);
+
+            double redGain = 1.0 + 0.32 * warmth + 0.12 * tintAmount;
+            double greenGain = 1.0 - 0.20 * tintAmount;
+            double blueGain = 1.0 - 0.32 * warmth + 0.12 * tintAmount;
+            double maximumGain = Math.Max(1.0,
+                Math.Max(redGain, Math.Max(greenGain, blueGain)));
+            redGain /= maximumGain;
+            greenGain /= maximumGain;
+            blueGain /= maximumGain;
+            double sat = Math.Max(0.0, Math.Min(2.0, saturation / 50.0));
+            double inverseSat = 1.0 - sat;
+            const double lr = 0.2126, lg = 0.7152, lb = 0.0722;
+
+            using (var writer = new StreamWriter(path, false, new UTF8Encoding(false)))
+            {
+                writer.WriteLine("# Generated by ShadePilot");
+                writer.WriteLine("# Hardware brightness and contrast are not included");
+                writer.WriteLine("TITLE \"ShadePilot current style\"");
+                writer.WriteLine("LUT_3D_SIZE " + size);
+                writer.WriteLine("DOMAIN_MIN 0.0 0.0 0.0");
+                writer.WriteLine("DOMAIN_MAX 1.0 1.0 1.0");
+                for (int b = 0; b < size; b++)
+                for (int g = 0; g < size; g++)
+                for (int r = 0; r < size; r++)
+                {
+                    double sourceR = r / (double)(size - 1);
+                    double sourceG = g / (double)(size - 1);
+                    double sourceB = b / (double)(size - 1);
+                    double mappedR = Map(sourceR, shadow, highlight, midtone,
+                        black, white, pivot, color, exp, shadowCoverage,
+                        highlightCoverage, softness) * redGain;
+                    double mappedG = Map(sourceG, shadow, highlight, midtone,
+                        black, white, pivot, color, exp, shadowCoverage,
+                        highlightCoverage, softness) * greenGain;
+                    double mappedB = Map(sourceB, shadow, highlight, midtone,
+                        black, white, pivot, color, exp, shadowCoverage,
+                        highlightCoverage, softness) * blueGain;
+                    double outR = (inverseSat * lr + sat) * mappedR +
+                        inverseSat * lg * mappedG + inverseSat * lb * mappedB;
+                    double outG = inverseSat * lr * mappedR +
+                        (inverseSat * lg + sat) * mappedG + inverseSat * lb * mappedB;
+                    double outB = inverseSat * lr * mappedR + inverseSat * lg * mappedG +
+                        (inverseSat * lb + sat) * mappedB;
+                    writer.WriteLine(string.Format(CultureInfo.InvariantCulture,
+                        "{0:F7} {1:F7} {2:F7}", Clamp01(outR), Clamp01(outG), Clamp01(outB)));
+                }
+            }
+        }
+
+        private static double Map(double value, double shadows, double highlights,
+            double midtones, double blackPoint, double whitePoint,
+            double contrastPivot, double vibrance, double exposure,
+            double shadowRange, double highlightRange, double transitionSoftness)
+        {
+            return GammaRampController.TransformValue(value, shadows, highlights,
+                midtones, blackPoint, whitePoint, contrastPivot, vibrance,
+                exposure, shadowRange, highlightRange, transitionSoftness);
+        }
+
+        private static double Clamp01(double value)
+        {
+            return Math.Max(0.0, Math.Min(1.0, value));
+        }
+    }
+
     internal sealed class GammaRampController
     {
-        private GammaRamp original;
-        public bool IsCaptured { get; private set; }
+        private readonly object operationLock = new object();
+        private readonly Dictionary<string, GammaRamp> originals =
+            new Dictionary<string, GammaRamp>(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> compatibilityBaselines =
+            new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        // Once a session baseline has been explicitly installed, it is the
+        // only source allowed for a Gamma transform. Re-reading after an
+        // effect was applied would turn ShadePilot's own ramp into "original".
+        private bool sessionBaselineInstalled;
+        private string targetDeviceName;
+        private string lastOperation = "尚未执行 Gamma 操作。";
+        public string LastOperation { get { lock (operationLock) return lastOperation; } }
+        public bool IsCaptured { get { return originals.ContainsKey(TargetKey); } }
+        public bool IsUsingCompatibilityBaseline { get {
+            return compatibilityBaselines.Contains(TargetKey);
+        } }
+        private string TargetKey { get { return string.IsNullOrWhiteSpace(targetDeviceName)
+            ? "__desktop__" : targetDeviceName; } }
+
+        public void SetTarget(string displayDeviceName)
+        {
+            lock (operationLock) targetDeviceName = displayDeviceName;
+        }
+
+        public void ApplyToTarget(
+            string displayDeviceName,
+            int shadowPercent, int highlightPercent, int midtoneValue,
+            int blackPointValue, int whitePointValue, int contrastPivotValue,
+            int temperatureValue, int tintValue, int vibranceValue,
+            int exposureValue, int shadowRangeValue,
+            int highlightRangeValue, int transitionSoftnessValue)
+        {
+            lock (operationLock)
+            {
+                targetDeviceName = displayDeviceName;
+                Apply(shadowPercent, highlightPercent, midtoneValue,
+                    blackPointValue, whitePointValue, contrastPivotValue,
+                    temperatureValue, tintValue, vibranceValue, exposureValue,
+                    shadowRangeValue, highlightRangeValue, transitionSoftnessValue);
+            }
+        }
+
+        private IntPtr CreateTargetDc()
+        {
+            if (string.IsNullOrWhiteSpace(targetDeviceName))
+                return GammaApi.GetDC(IntPtr.Zero);
+            // A display DC is documented as driver="DISPLAY" plus the
+            // EnumDisplayDevices device name (for example \\.\DISPLAY1).
+            IntPtr dc = GammaApi.CreateDC("DISPLAY", targetDeviceName, null, IntPtr.Zero);
+            if (dc == IntPtr.Zero)
+                dc = GammaApi.CreateDC(targetDeviceName, null, null, IntPtr.Zero);
+            return dc;
+        }
+
+        public void InvalidateCapturedRamps()
+        {
+            lock (operationLock)
+            {
+                if (sessionBaselineInstalled)
+                {
+                    lastOperation = "显示环境已变化；保留本会话 Gamma 基线，未重新采集当前曲线。";
+                    return;
+                }
+                originals.Clear();
+                compatibilityBaselines.Clear();
+                lastOperation = "显示环境已变化，Gamma 基线将在下次应用时重新读取。";
+            }
+        }
+
+        public GammaBaseline CaptureSystemBaseline(string displayDeviceName)
+        {
+            lock (operationLock)
+            {
+                string previous = targetDeviceName;
+                targetDeviceName = displayDeviceName;
+                try
+                {
+                    IntPtr dc = CreateTargetDc();
+                    if (dc == IntPtr.Zero)
+                        return GammaBaseline.Unavailable(displayDeviceName, "无法取得显示设备 DC。");
+                    try
+                    {
+                        GammaRamp ramp = GammaRamp.Create();
+                        if (!GammaApi.GetDeviceGammaRamp(dc, ref ramp))
+                            return GammaBaseline.Unavailable(displayDeviceName,
+                                "GetDeviceGammaRamp 返回失败，Win32=" + Marshal.GetLastWin32Error());
+                        return GammaBaseline.From(displayDeviceName, ramp);
+                    }
+                    finally { ReleaseTargetDc(dc); }
+                }
+                finally { targetDeviceName = previous; }
+            }
+        }
+
+        public void InstallSystemBaselines(IEnumerable<GammaBaseline> baselines)
+        {
+            lock (operationLock)
+            {
+                originals.Clear();
+                compatibilityBaselines.Clear();
+                foreach (var baseline in baselines ?? Enumerable.Empty<GammaBaseline>())
+                {
+                    if (baseline == null || !baseline.IsReadable ||
+                        string.IsNullOrWhiteSpace(baseline.DisplayDeviceName) ||
+                        !baseline.IsValid()) continue;
+                    originals[baseline.DisplayDeviceName] = baseline.ToRamp();
+                }
+                sessionBaselineInstalled = true;
+                lastOperation = "已安装本会话 Gamma 基线：" + originals.Count + " 个输出。";
+            }
+        }
+
+        private void ReleaseTargetDc(IntPtr dc)
+        {
+            if (dc == IntPtr.Zero) return;
+            if (string.IsNullOrWhiteSpace(targetDeviceName))
+                GammaApi.ReleaseDC(IntPtr.Zero, dc);
+            else GammaApi.DeleteDC(dc);
+        }
 
         public void CaptureOriginal()
         {
-            IntPtr dc = GammaApi.GetDC(IntPtr.Zero);
+            lock (operationLock)
+            {
+            IntPtr dc = CreateTargetDc();
             if (dc == IntPtr.Zero) throw new InvalidOperationException("无法取得桌面显示设备。");
             try
             {
-                original = GammaRamp.Create();
-                if (!GammaApi.GetDeviceGammaRamp(dc, ref original))
-                    throw new InvalidOperationException("显卡驱动不支持读取 Gamma Ramp。");
-                IsCaptured = true;
+                GammaRamp captured = GammaRamp.Create();
+                if (!GammaApi.GetDeviceGammaRamp(dc, ref captured))
+                {
+                    captured = GammaRamp.CreateIdentity();
+                    compatibilityBaselines.Add(TargetKey);
+                }
+                else compatibilityBaselines.Remove(TargetKey);
+                originals[TargetKey] = captured;
             }
-            finally { GammaApi.ReleaseDC(IntPtr.Zero, dc); }
+            finally { ReleaseTargetDc(dc); }
+            }
         }
 
         public void Apply(
@@ -2150,7 +3738,15 @@ namespace DisplayPresetPrototype
             int exposureValue, int shadowRangeValue,
             int highlightRangeValue, int transitionSoftnessValue)
         {
-            if (!IsCaptured) CaptureOriginal();
+            lock (operationLock)
+            {
+            if (!IsCaptured)
+            {
+                if (sessionBaselineInstalled)
+                    throw new InvalidOperationException(
+                        "当前输出没有可验证的本会话 Gamma 基线；为避免污染原始状态，已拒绝应用软件曲线。");
+                CaptureOriginal();
+            }
             double shadow = ScalePositive(shadowPercent, 200);
             double highlight = ScalePositive(highlightPercent, 200);
             double midtone = ScaleSigned(midtoneValue);
@@ -2173,6 +3769,7 @@ namespace DisplayPresetPrototype
             greenGain /= maximumGain;
             blueGain /= maximumGain;
 
+            GammaRamp original = originals[TargetKey];
             GammaRamp ramp = GammaRamp.Create();
             BuildChannel(original.Red, ramp.Red, shadow, highlight, midtone,
                 blackPoint, whitePoint, contrastPivot, vibrance, exposure,
@@ -2184,6 +3781,7 @@ namespace DisplayPresetPrototype
                 blackPoint, whitePoint, contrastPivot, vibrance, exposure,
                 shadowRange, highlightRange, transitionSoftness, blueGain);
             SetAndVerify(ramp);
+            }
         }
 
         // Give the first half of every slider useful resolution. The old linear
@@ -2203,8 +3801,46 @@ namespace DisplayPresetPrototype
 
         public void Restore()
         {
+            lock (operationLock)
+            {
             if (!IsCaptured) return;
-            SetRamp(original);
+            SetRamp(originals[TargetKey]);
+            }
+        }
+
+        public void RestoreAll()
+        {
+            lock (operationLock)
+            {
+            string previous = targetDeviceName;
+            foreach (var pair in new List<KeyValuePair<string, GammaRamp>>(originals))
+            {
+                targetDeviceName = pair.Key == "__desktop__" ? null : pair.Key;
+                try { SetRamp(pair.Value); } catch { }
+            }
+            targetDeviceName = previous;
+            }
+        }
+
+        // Recovery must not silently mark a session clean when one of the
+        // baseline ramps could not be written. The regular UI restore remains
+        // best-effort, while this path reports every failed output.
+        public void RestoreSystemBaselines()
+        {
+            lock (operationLock)
+            {
+                string previous = targetDeviceName;
+                var failures = new List<string>();
+                foreach (var pair in new List<KeyValuePair<string, GammaRamp>>(originals))
+                {
+                    targetDeviceName = pair.Key == "__desktop__" ? null : pair.Key;
+                    try { SetRamp(pair.Value.DeepClone()); }
+                    catch (Exception ex) { failures.Add(pair.Key + "：" + ex.Message); }
+                }
+                targetDeviceName = previous;
+                if (failures.Count != 0)
+                    throw new InvalidOperationException(string.Join("；", failures));
+            }
         }
 
         private static void BuildChannel(
@@ -2275,35 +3911,57 @@ namespace DisplayPresetPrototype
             return Math.Max(0.0, Math.Min(1.0, y));
         }
 
-        private static void SetAndVerify(GammaRamp ramp)
+        private void SetAndVerify(GammaRamp ramp)
         {
             SetRamp(ramp);
-            IntPtr dc = GammaApi.GetDC(IntPtr.Zero);
-            if (dc == IntPtr.Zero) throw new InvalidOperationException("无法回读桌面 Gamma。");
-            try
+            if (compatibilityBaselines.Contains(TargetKey)) return;
+            GammaRamp actual = GammaRamp.Create();
+            bool read = false;
+            for (int attempt = 1; attempt <= 3 && !read; attempt++)
             {
-                GammaRamp actual = GammaRamp.Create();
-                if (!GammaApi.GetDeviceGammaRamp(dc, ref actual))
-                    throw new InvalidOperationException("Gamma 已写入，但显卡驱动拒绝回读确认。");
-                int differences = 0;
-                for (int i = 0; i < 256; i += 16)
-                    if (Math.Abs(actual.Red[i] - ramp.Red[i]) > 512) differences++;
-                if (differences > 8)
-                    throw new InvalidOperationException("显卡驱动覆盖或忽略了 Gamma 曲线；请确认处于 SDR 模式。");
+                if (attempt > 1) Thread.Sleep(attempt == 2 ? 80 : 180);
+                IntPtr dc = CreateTargetDc();
+                if (dc == IntPtr.Zero) continue;
+                try { read = GammaApi.GetDeviceGammaRamp(dc, ref actual); }
+                finally { ReleaseTargetDc(dc); }
             }
-            finally { GammaApi.ReleaseDC(IntPtr.Zero, dc); }
+            if (!read)
+                throw new InvalidOperationException("Gamma 已写入，但显示输出路径暂时拒绝回读；请等待全屏或显卡切换完成后重试。");
+            int differences = 0;
+            for (int i = 0; i < 256; i += 16)
+                if (Math.Abs(actual.Red[i] - ramp.Red[i]) > 512) differences++;
+            if (differences > 8)
+                throw new InvalidOperationException("显卡驱动或色彩管理覆盖了 Gamma 曲线；请确认处于 SDR，并关闭其他调色程序后重试。");
+            lastOperation = "Gamma 写入并回读成功：" + TargetKey;
         }
 
-        private static void SetRamp(GammaRamp ramp)
+        private void SetRamp(GammaRamp ramp)
         {
-            IntPtr dc = GammaApi.GetDC(IntPtr.Zero);
-            if (dc == IntPtr.Zero) throw new InvalidOperationException("无法取得桌面显示设备。");
-            try
+            int lastError = 0;
+            for (int attempt = 1; attempt <= 3; attempt++)
             {
-                if (!GammaApi.SetDeviceGammaRamp(dc, ref ramp))
-                    throw new InvalidOperationException("显卡驱动拒绝设置 Gamma Ramp。");
+                if (attempt > 1) Thread.Sleep(attempt == 2 ? 120 : 260);
+                IntPtr dc = CreateTargetDc();
+                if (dc == IntPtr.Zero)
+                {
+                    lastError = Marshal.GetLastWin32Error();
+                    continue;
+                }
+                try
+                {
+                    if (GammaApi.SetDeviceGammaRamp(dc, ref ramp))
+                    {
+                        lastOperation = "Gamma 写入成功：" + TargetKey + "（第 " + attempt + " 次）";
+                        return;
+                    }
+                    lastError = Marshal.GetLastWin32Error();
+                }
+                finally { ReleaseTargetDc(dc); }
             }
-            finally { GammaApi.ReleaseDC(IntPtr.Zero, dc); }
+            lastOperation = "Gamma 写入失败：" + TargetKey + "，Win32=" + lastError;
+            throw new InvalidOperationException(
+                "显示输出路径连续 3 次拒绝 Gamma Ramp（Win32 " + lastError +
+                "）。这通常发生在混合显卡、全屏或 HDR 正在切换时，请稍后重试。");
         }
     }
 
@@ -2323,6 +3981,76 @@ namespace DisplayPresetPrototype
                 Red = new ushort[256], Green = new ushort[256], Blue = new ushort[256]
             };
         }
+
+        public static GammaRamp CreateIdentity()
+        {
+            GammaRamp ramp = Create();
+            for (int i = 0; i < 256; i++)
+            {
+                ushort value = (ushort)(i * 257);
+                ramp.Red[i] = ramp.Green[i] = ramp.Blue[i] = value;
+            }
+            return ramp;
+        }
+
+        public GammaRamp DeepClone()
+        {
+            return new GammaRamp {
+                Red = Red == null ? null : (ushort[])Red.Clone(),
+                Green = Green == null ? null : (ushort[])Green.Clone(),
+                Blue = Blue == null ? null : (ushort[])Blue.Clone()
+            };
+        }
+    }
+
+    [DataContract]
+    internal sealed class GammaBaseline
+    {
+        [DataMember] public string DisplayDeviceName;
+        [DataMember] public bool IsReadable;
+        [DataMember] public string ReadFailure;
+        [DataMember] public ushort[] Red;
+        [DataMember] public ushort[] Green;
+        [DataMember] public ushort[] Blue;
+
+        public static GammaBaseline From(string deviceName, GammaRamp ramp)
+        {
+            return new GammaBaseline {
+                DisplayDeviceName = deviceName,
+                IsReadable = true,
+                Red = ramp.Red == null ? null : (ushort[])ramp.Red.Clone(),
+                Green = ramp.Green == null ? null : (ushort[])ramp.Green.Clone(),
+                Blue = ramp.Blue == null ? null : (ushort[])ramp.Blue.Clone()
+            };
+        }
+
+        public static GammaBaseline Unavailable(string deviceName, string reason)
+        {
+            return new GammaBaseline { DisplayDeviceName = deviceName, IsReadable = false, ReadFailure = reason };
+        }
+
+        public bool IsValid()
+        {
+            return Red?.Length == 256 && Green?.Length == 256 && Blue?.Length == 256;
+        }
+
+        public GammaRamp ToRamp()
+        {
+            if (!IsValid()) throw new InvalidOperationException("持久化的 Gamma 基线数据无效。");
+            return new GammaRamp {
+                Red = (ushort[])Red.Clone(), Green = (ushort[])Green.Clone(), Blue = (ushort[])Blue.Clone()
+            };
+        }
+
+        public GammaBaseline DeepClone()
+        {
+            return new GammaBaseline {
+                DisplayDeviceName = DisplayDeviceName, IsReadable = IsReadable, ReadFailure = ReadFailure,
+                Red = Red == null ? null : (ushort[])Red.Clone(),
+                Green = Green == null ? null : (ushort[])Green.Clone(),
+                Blue = Blue == null ? null : (ushort[])Blue.Clone()
+            };
+        }
     }
 
     internal static class GammaApi
@@ -2331,6 +4059,11 @@ namespace DisplayPresetPrototype
         internal static extern IntPtr GetDC(IntPtr window);
         [DllImport("user32.dll")]
         internal static extern int ReleaseDC(IntPtr window, IntPtr dc);
+        [DllImport("gdi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        internal static extern IntPtr CreateDC(
+            string driver, string device, string output, IntPtr initData);
+        [DllImport("gdi32.dll")]
+        internal static extern bool DeleteDC(IntPtr dc);
         [DllImport("gdi32.dll", SetLastError = true)]
         internal static extern bool GetDeviceGammaRamp(IntPtr dc, ref GammaRamp ramp);
         [DllImport("gdi32.dll", SetLastError = true)]
@@ -2339,10 +4072,12 @@ namespace DisplayPresetPrototype
 
     internal sealed class PhysicalDisplay : IDisposable
     {
-        private readonly object ioLock = new object();
+        private static readonly object GlobalDdcLock = new object();
         public IntPtr Handle;
         public string Name;
         public string Id;
+        public string DisplayDeviceName;
+        public string DisplayAdapterName;
         public uint Capabilities;
         public uint BrightnessMin, BrightnessCurrent, BrightnessMax;
         public uint ContrastMin, ContrastCurrent, ContrastMax;
@@ -2350,6 +4085,7 @@ namespace DisplayPresetPrototype
         public bool BrightnessUsesLowLevel;
         public bool ContrastUsesLowLevel;
         public bool SaturationUsesLowLevel;
+        public bool SaturationRestoreSafe;
         public string ProbeNote;
 
         public bool SupportsBrightness { get { return (Capabilities & 0x2) != 0; } }
@@ -2358,6 +4094,8 @@ namespace DisplayPresetPrototype
 
         public void Refresh()
         {
+            lock (GlobalDdcLock)
+            {
             uint caps, temps;
             bool capabilityQueryWorked = MonitorApi.GetMonitorCapabilities(Handle, out caps, out temps);
             if (!capabilityQueryWorked)
@@ -2408,18 +4146,30 @@ namespace DisplayPresetPrototype
 
             uint saturationCurrent, saturationMaximum;
             MonitorApi.MC_VCP_CODE_TYPE saturationType;
-            if (MonitorApi.GetVCPFeatureAndVCPFeatureReply(
-                Handle, 0x8A, out saturationType, out saturationCurrent, out saturationMaximum) &&
-                saturationMaximum > 0)
+            bool saturationRead = MonitorApi.GetVCPFeatureAndVCPFeatureReply(
+                Handle, 0x8A, out saturationType, out saturationCurrent, out saturationMaximum);
+            Thread.Sleep(70);
+            uint confirmedCurrent = 0, confirmedMaximum = 0;
+            MonitorApi.MC_VCP_CODE_TYPE confirmedType =
+                MonitorApi.MC_VCP_CODE_TYPE.MC_MOMENTARY;
+            bool saturationConfirmed = saturationRead &&
+                MonitorApi.GetVCPFeatureAndVCPFeatureReply(
+                    Handle, 0x8A, out confirmedType, out confirmedCurrent, out confirmedMaximum);
+            if (saturationConfirmed && saturationType == MonitorApi.MC_VCP_CODE_TYPE.MC_SET_PARAMETER &&
+                confirmedType == saturationType && saturationMaximum == confirmedMaximum &&
+                saturationCurrent == confirmedCurrent && saturationMaximum >= 10 &&
+                saturationMaximum <= 255 && saturationCurrent <= saturationMaximum)
             {
                 SaturationMin = 0;
                 SaturationCurrent = saturationCurrent;
                 SaturationMax = saturationMaximum;
                 SaturationUsesLowLevel = true;
+                SaturationRestoreSafe = true;
             }
             else
             {
                 SaturationMin = SaturationCurrent = SaturationMax = 0;
+                SaturationRestoreSafe = false;
             }
 
             ProbeNote = capabilityQueryWorked
@@ -2427,12 +4177,20 @@ namespace DisplayPresetPrototype
                 : (brightnessRead || contrastRead
                     ? "高层查询失败，已使用低层 DDC/CI 白名单回退"
                     : "高层与低层 DDC/CI 均未返回可用参数");
+            }
+        }
 
+        public void MarkProbeFailed()
+        {
+            Capabilities = 0;
+            SaturationMin = SaturationCurrent = SaturationMax = 0;
+            SaturationRestoreSafe = false;
+            ProbeNote = "DDC/CI 探测失败；已禁用硬件写入以保护恢复参数";
         }
 
         public void SetBrightness(uint value)
         {
-            lock (ioLock)
+            lock (GlobalDdcLock)
             {
                 BrightnessCurrent = WriteAndVerifyVcp(
                     0x10, value, BrightnessCurrent, BrightnessMax,
@@ -2442,7 +4200,7 @@ namespace DisplayPresetPrototype
         }
         public void SetContrast(uint value)
         {
-            lock (ioLock)
+            lock (GlobalDdcLock)
             {
                 ContrastCurrent = WriteAndVerifyVcp(
                     0x12, value, ContrastCurrent, ContrastMax,
@@ -2452,7 +4210,7 @@ namespace DisplayPresetPrototype
         }
         public void SetSaturation(uint value)
         {
-            lock (ioLock)
+            lock (GlobalDdcLock)
             {
                 SaturationCurrent = WriteAndVerifyVcp(
                     0x8A, value, SaturationCurrent, SaturationMax,
@@ -2501,7 +4259,7 @@ namespace DisplayPresetPrototype
         }
         public void Dispose()
         {
-            lock (ioLock)
+            lock (GlobalDdcLock)
             {
                 if (Handle != IntPtr.Zero)
                 {
@@ -2512,23 +4270,40 @@ namespace DisplayPresetPrototype
         }
     }
 
+    [DataContract]
     internal sealed class Snapshot
     {
-        public bool HasBrightness, HasContrast, HasSaturation;
-        public uint Brightness, Contrast, Saturation;
+        [DataMember] public bool HasBrightness, HasContrast, HasSaturation;
+        [DataMember] public uint Brightness, Contrast, Saturation;
         public static Snapshot From(PhysicalDisplay d)
         {
             return new Snapshot {
                 HasBrightness = d.SupportsBrightness, Brightness = d.BrightnessCurrent,
                 HasContrast = d.SupportsContrast, Contrast = d.ContrastCurrent,
-                HasSaturation = d.SupportsSaturation, Saturation = d.SaturationCurrent
+                HasSaturation = d.SupportsSaturation && d.SaturationRestoreSafe,
+                Saturation = d.SaturationCurrent
             };
         }
         public void Apply(PhysicalDisplay d)
         {
-            if (HasBrightness && d.SupportsBrightness) { d.SetBrightness(Brightness); Thread.Sleep(80); }
-            if (HasContrast && d.SupportsContrast) { d.SetContrast(Contrast); Thread.Sleep(80); }
-            if (HasSaturation && d.SupportsSaturation) { d.SetSaturation(Saturation); Thread.Sleep(80); }
+            if (HasBrightness && d.SupportsBrightness && d.BrightnessCurrent != Brightness)
+                { d.SetBrightness(Brightness); Thread.Sleep(80); }
+            if (HasContrast && d.SupportsContrast && d.ContrastCurrent != Contrast)
+                { d.SetContrast(Contrast); Thread.Sleep(80); }
+            // VCP 0x8A is restored only when both capture and the current
+            // output passed the existing double-read safety probe. This keeps
+            // synthetic hybrid-GPU values out of the recovery path while
+            // allowing a verified hardware baseline to be restored.
+            if (HasSaturation && d.SupportsSaturation && d.SaturationRestoreSafe &&
+                d.SaturationCurrent != Saturation)
+                { d.SetSaturation(Saturation); Thread.Sleep(80); }
+        }
+        public Snapshot DeepClone()
+        {
+            return new Snapshot {
+                HasBrightness = HasBrightness, HasContrast = HasContrast, HasSaturation = HasSaturation,
+                Brightness = Brightness, Contrast = Contrast, Saturation = Saturation
+            };
         }
     }
 
@@ -2545,6 +4320,8 @@ namespace DisplayPresetPrototype
         [DataMember] public int Temperature;
         [DataMember] public int Tint;
         [DataMember] public int Vibrance;
+        // User-facing saturation is normalized to 0..100 with 50 as neutral.
+        [DataMember] public int Saturation = 50;
         [DataMember] public int Exposure;
         [DataMember] public int ShadowRange;
         [DataMember] public int HighlightRange;
@@ -2552,6 +4329,17 @@ namespace DisplayPresetPrototype
         [DataMember] public int HotkeyKey;
         [DataMember] public uint HotkeyModifiers;
         public override string ToString() { return Name; }
+        public StylePresetData DeepClone()
+        {
+            return new StylePresetData {
+                Name = Name, Shadows = Shadows, Highlights = Highlights, Midtones = Midtones,
+                BlackPoint = BlackPoint, WhitePoint = WhitePoint, ContrastPivot = ContrastPivot,
+                Temperature = Temperature, Tint = Tint, Vibrance = Vibrance, Saturation = Saturation,
+                Exposure = Exposure, ShadowRange = ShadowRange, HighlightRange = HighlightRange,
+                TransitionSoftness = TransitionSoftness, HotkeyKey = HotkeyKey,
+                HotkeyModifiers = HotkeyModifiers
+            };
+        }
     }
 
     [DataContract]
@@ -2560,6 +4348,9 @@ namespace DisplayPresetPrototype
         [DataMember] public List<StylePresetData> Items = new List<StylePresetData>();
         [DataMember] public int RestoreHotkeyKey;
         [DataMember] public uint RestoreHotkeyModifiers;
+        [DataMember] public int CycleHotkeyKey;
+        [DataMember] public uint CycleHotkeyModifiers;
+        [DataMember] public List<string> CyclePresetNames = new List<string>();
         [DataMember] public int SchemaVersion;
 
         private static string Folder {
@@ -2581,11 +4372,15 @@ namespace DisplayPresetPrototype
                     }
                     if (loaded != null && loaded.Items != null && loaded.Items.Count > 0)
                     {
+                        if (loaded.CyclePresetNames == null)
+                            loaded.CyclePresetNames = new List<string>();
                         if (loaded.SchemaVersion < 2) loaded.UpgradeCuratedPresets();
                             if (loaded.SchemaVersion < 3) loaded.UpgradeAdvancedControls();
                             if (loaded.SchemaVersion < 4) loaded.RemoveLegacyDefaultHotkeys();
                             if (loaded.SchemaVersion < 5) loaded.UpgradeNewToneControls();
                             if (loaded.SchemaVersion < 6) loaded.UpgradeCurveV2Presets();
+                            if (loaded.SchemaVersion < 7) loaded.UpgradePresetSaturation();
+                            if (loaded.SchemaVersion < 8) loaded.UpgradeSaturationNeutral50();
                         return loaded;
                     }
                 }
@@ -2599,7 +4394,7 @@ namespace DisplayPresetPrototype
             var store = new StyleSettingsStore {
                 RestoreHotkeyKey = 0,
                 RestoreHotkeyModifiers = 0,
-                SchemaVersion = 6
+                SchemaVersion = 8
             };
             AddCurated(store.Items);
             return store;
@@ -2724,6 +4519,26 @@ namespace DisplayPresetPrototype
             Save();
         }
 
+        private void UpgradePresetSaturation()
+        {
+            foreach (var item in Items)
+                if (item.Saturation <= 0) item.Saturation = 100;
+            SchemaVersion = 7;
+            Save();
+        }
+
+        private void UpgradeSaturationNeutral50()
+        {
+            // Schema 7 stored Windows-style values where 100 was neutral.
+            // Preserve the visual intent while moving the public scale to a
+            // consistent 0..100 range where 50 is neutral.
+            foreach (var item in Items)
+                item.Saturation = Math.Max(0, Math.Min(100,
+                    (int)Math.Round((item.Saturation <= 0 ? 100 : item.Saturation) / 2.0)));
+            SchemaVersion = 8;
+            Save();
+        }
+
         private static void CopyCurveValues(StylePresetData source, StylePresetData target)
         {
             target.Shadows = source.Shadows;
@@ -2735,6 +4550,7 @@ namespace DisplayPresetPrototype
             target.Temperature = source.Temperature;
             target.Tint = source.Tint;
             target.Vibrance = source.Vibrance;
+            target.Saturation = source.Saturation <= 0 ? 50 : source.Saturation;
             target.Exposure = source.Exposure;
             target.ShadowRange = source.ShadowRange;
             target.HighlightRange = source.HighlightRange;
@@ -2751,6 +4567,25 @@ namespace DisplayPresetPrototype
             target.Add(new StylePresetData { Name = "中性通透", Shadows = 20, Highlights = 28, Midtones = 5, BlackPoint = -4, WhitePoint = 0, ContrastPivot = 10, Temperature = 0, Tint = 0, Vibrance = 16, Exposure = 3, ShadowRange = 7, HighlightRange = 3, TransitionSoftness = 7 });
         }
 
+        public int RestoreBuiltInPresets()
+        {
+            if (Items == null) Items = new List<StylePresetData>();
+            var builtIns = new List<StylePresetData>();
+            AddCurated(builtIns);
+            int restored = 0;
+            foreach (var preset in builtIns)
+            {
+                bool exists = Items.Exists(item => item != null &&
+                    string.Equals(item.Name, preset.Name,
+                        StringComparison.OrdinalIgnoreCase));
+                if (exists) continue;
+                Items.Add(preset);
+                restored++;
+            }
+            if (restored > 0) Save();
+            return restored;
+        }
+
         public void Save()
         {
             Directory.CreateDirectory(Folder);
@@ -2764,8 +4599,30 @@ namespace DisplayPresetPrototype
     {
         [DataMember] public bool StartWithWindows;
         [DataMember] public bool StartMinimized;
+        [DataMember] public bool CloseToTray;
         [DataMember] public bool AutoReapply;
         [DataMember] public int StrengthMode;
+        [DataMember] public bool GameAutoSwitchEnabled;
+        [DataMember] public bool RestoreAfterGame = true;
+        [DataMember] public bool FrameGenerationCompatibility = true;
+        [DataMember] public List<GamePresetRule> GameRules = new List<GamePresetRule>();
+        [DataMember] public int HoldOriginalKey;
+        [DataMember] public uint HoldOriginalModifiers;
+        // 0 = auto, 1 = monitor DDC/CI, 2 = Windows software color.
+        [DataMember] public int SaturationBackend;
+        [DataMember] public bool SyncAllDisplays;
+        // Name only: startup selects this preset but never auto-applies it.
+        // Runtime display state and recovery baseline remain independent.
+        [DataMember] public string DefaultPresetName;
+        // V2 simple-adjustment UI state. These are UI preferences only; they
+        // never replace the recovery baseline or write a preset implicitly.
+        [DataMember] public bool SimpleStyleMode = true;
+        [DataMember] public int SimpleBrightness;
+        [DataMember] public int SimpleDarkArea;
+        [DataMember] public int SimpleClarity = 50;
+        [DataMember] public int SimpleColor;
+        [DataMember] public int SimpleTonalDepth;
+        [DataMember] public int SimpleTemperature;
         [DataMember] public int SchemaVersion;
 
         private static string Folder {
@@ -2785,19 +4642,36 @@ namespace DisplayPresetPrototype
                             typeof(AppSettingsStore)).ReadObject(stream);
                     if (loaded != null)
                     {
+                        if (loaded.GameRules == null)
+                            loaded.GameRules = new List<GamePresetRule>();
                         if (loaded.SchemaVersion < 1)
                         {
                             loaded.AutoReapply = true;
                             loaded.StrengthMode = 1;
                             loaded.SchemaVersion = 1;
-                            loaded.Save();
                         }
+                        if (loaded.SchemaVersion < 2)
+                        {
+                            loaded.FrameGenerationCompatibility = true;
+                            loaded.SchemaVersion = 2;
+                        }
+                        if (loaded.SchemaVersion < 3)
+                        {
+                            loaded.SimpleStyleMode = true;
+                            loaded.SimpleClarity = 50;
+                            loaded.SchemaVersion = 3;
+                        }
+                        loaded.Save();
                         return loaded;
                     }
                 }
             }
             catch { }
-            return new AppSettingsStore { AutoReapply = true, StrengthMode = 1, SchemaVersion = 1 };
+            return new AppSettingsStore {
+                AutoReapply = true, StrengthMode = 1,
+                FrameGenerationCompatibility = true, SimpleStyleMode = true,
+                SimpleClarity = 50, SchemaVersion = 3
+            };
         }
 
         public void Save()
@@ -2820,6 +4694,16 @@ namespace DisplayPresetPrototype
         }
     }
 
+    [DataContract]
+    internal sealed class GamePresetRule
+    {
+        [DataMember] public string ProcessName;
+        [DataMember] public string PresetName;
+        public override string ToString() {
+            return ProcessName + "  →  " + PresetName;
+        }
+    }
+
     internal sealed class AppTheme
     {
         public readonly string Name;
@@ -2835,6 +4719,106 @@ namespace DisplayPresetPrototype
             Button = button; Ink = ink; Muted = muted; OnAccent = onAccent;
         }
         public override string ToString() { return Name; }
+    }
+
+    internal static class SecondaryWindowTheme
+    {
+        public static void Apply(Form form)
+        {
+            AppTheme theme = ThemeManager.Current;
+            form.BackColor = theme.Canvas;
+            foreach (Control control in form.Controls)
+            {
+                var panel = control as RoundedPanel;
+                if (panel != null)
+                {
+                    panel.FillColor = Equals(panel.Tag, "TintCard")
+                        ? theme.TintSurface : theme.Surface;
+                    panel.Invalidate();
+                    ApplyCardChildren(panel.Controls, theme, panel.FillColor);
+                }
+            }
+            foreach (Control control in form.Controls)
+            {
+                if (control is RoundedPanel) continue;
+                Color surface = SurfaceFor(form, control, theme);
+                var button = control as RoundedButton;
+                if (button != null)
+                {
+                    bool primary = button.ForeColor == Color.White;
+                    button.BackColor = primary ? theme.Accent : theme.Button;
+                    button.ForeColor = primary ? theme.OnAccent : theme.Ink;
+                    button.SurfaceColor = surface;
+                    button.Invalidate();
+                }
+                else if (control is TextBox || control is ComboBox ||
+                         control is ListBox || control is CheckedListBox ||
+                         control is NumericUpDown)
+                {
+                    control.BackColor = theme.SoftSurface;
+                    control.ForeColor = theme.Ink;
+                    var combo = control as ThemedComboBox;
+                    if (combo != null) combo.BorderColor = theme.SoftSurface;
+                }
+                else if (control is TrackBar)
+                {
+                    control.BackColor = surface;
+                    control.ForeColor = theme.Ink;
+                }
+                else
+                {
+                    control.BackColor = surface;
+                    control.ForeColor = control.ForeColor == Color.Firebrick
+                        ? Color.Firebrick : theme.Ink;
+                }
+                control.Invalidate();
+            }
+            form.Invalidate(true);
+        }
+
+        private static void ApplyCardChildren(Control.ControlCollection controls,
+            AppTheme theme, Color surface)
+        {
+            foreach (Control control in controls)
+            {
+                var button = control as RoundedButton;
+                if (button != null)
+                {
+                    bool primary = button.ForeColor == Color.White;
+                    button.BackColor = primary ? theme.Accent : theme.Button;
+                    button.ForeColor = primary ? theme.OnAccent : theme.Ink;
+                    button.SurfaceColor = surface;
+                }
+                else if (control is TextBox || control is ComboBox ||
+                         control is ListBox || control is NumericUpDown)
+                {
+                    control.BackColor = theme.SoftSurface;
+                    control.ForeColor = theme.Ink;
+                }
+                else
+                {
+                    control.BackColor = Color.Transparent;
+                    control.ForeColor = control.ForeColor == Color.Firebrick
+                        ? Color.Firebrick : theme.Ink;
+                }
+                if (control.HasChildren)
+                    ApplyCardChildren(control.Controls, theme, surface);
+                control.Invalidate();
+            }
+        }
+
+        private static Color SurfaceFor(Form form, Control control, AppTheme theme)
+        {
+            Point center = new Point(control.Left + control.Width / 2,
+                control.Top + control.Height / 2);
+            foreach (Control candidate in form.Controls)
+            {
+                var panel = candidate as RoundedPanel;
+                if (panel != null && panel.Bounds.Contains(center))
+                    return panel.FillColor;
+            }
+            return theme.Canvas;
+        }
     }
 
     internal static class ThemeManager
@@ -2906,6 +4890,7 @@ namespace DisplayPresetPrototype
         private readonly NumericUpDown temperatureBox = NewNumber(-100, 100);
         private readonly NumericUpDown tintBox = NewNumber(-100, 100);
         private readonly NumericUpDown vibranceBox = NewNumber(-100, 100);
+        private readonly NumericUpDown saturationBox = NewNumber(0, 100);
         private readonly NumericUpDown exposureBox = NewNumber(-100, 100);
         private readonly NumericUpDown shadowRangeBox = NewNumber(-100, 100);
         private readonly NumericUpDown highlightRangeBox = NewNumber(-100, 100);
@@ -2918,13 +4903,21 @@ namespace DisplayPresetPrototype
             this.store = store;
             Text = "管理画面风格";
             ClientSize = new Size(720, 650);
+            MinimumSize = new Size(600, 500);
             StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             Font = new Font("Microsoft YaHei UI", 9F);
             BackColor = Color.FromArgb(245, 247, 251);
+            AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScroll = true;
+            AutoScrollMinSize = new Size(720, 650);
+
+            var listCard = new RoundedPanel { Location = new Point(18, 80), Size = new Size(238, 500), Tag = "TintCard" };
+            var editorCard = new RoundedPanel { Location = new Point(260, 80), Size = new Size(442, 500), Tag = "SurfaceCard" };
+            Controls.AddRange(new Control[] { listCard, editorCard });
 
             Controls.Add(new Label {
                 Text = "预设管理", AutoSize = true, Location = new Point(24, 18),
@@ -2957,25 +4950,29 @@ namespace DisplayPresetPrototype
             AddField("暗部范围", shadowRangeBox, 420, 358);
             AddField("高光范围", highlightRangeBox, 570, 358);
             AddField("过渡柔和", transitionSoftnessBox, 270, 428);
+            AddField("饱和度", saturationBox, 420, 428);
 
             var save = NewButton("保存修改", 270, 510, 112, true);
             save.Click += delegate { SaveSelected(); };
             var delete = NewButton("删除预设", 394, 510, 112, false);
             delete.Click += delegate { DeleteSelected(); };
-            var import = NewButton("导入", 518, 510, 82, false);
-            import.Click += delegate { ImportPresets(); };
-            var export = NewButton("导出", 610, 510, 82, false);
-            export.Click += delegate { ExportPresets(); };
+            var restoreBuiltIns = NewButton("恢复内置预设", 518, 510, 164, false);
+            restoreBuiltIns.Click += delegate { RestoreBuiltInPresets(); };
             var done = NewButton("完成", 596, 592, 96, true);
             done.DialogResult = DialogResult.OK;
             status.Location = new Point(270, 562);
             status.Size = new Size(420, 24);
             status.ForeColor = Color.FromArgb(45, 90, 55);
-            Controls.AddRange(new Control[] { save, delete, import, export, done, status });
+            Controls.AddRange(new Control[] {
+                save, delete, restoreBuiltIns, done, status
+            });
             AcceptButton = done;
 
             ConfigureToolTips();
             RefreshList(selected);
+            editorCard.SendToBack();
+            listCard.SendToBack();
+            SecondaryWindowTheme.Apply(this);
         }
 
         private void ExportPresets()
@@ -3122,6 +5119,7 @@ namespace DisplayPresetPrototype
             temperatureBox.Value = Math.Max(temperatureBox.Minimum, Math.Min(temperatureBox.Maximum, item.Temperature));
             tintBox.Value = Math.Max(tintBox.Minimum, Math.Min(tintBox.Maximum, item.Tint));
             vibranceBox.Value = Math.Max(vibranceBox.Minimum, Math.Min(vibranceBox.Maximum, item.Vibrance));
+            saturationBox.Value = Math.Max(saturationBox.Minimum, Math.Min(saturationBox.Maximum, item.Saturation <= 0 ? 50 : item.Saturation));
             exposureBox.Value = Math.Max(exposureBox.Minimum, Math.Min(exposureBox.Maximum, item.Exposure));
             shadowRangeBox.Value = Math.Max(shadowRangeBox.Minimum, Math.Min(shadowRangeBox.Maximum, item.ShadowRange));
             highlightRangeBox.Value = Math.Max(highlightRangeBox.Minimum, Math.Min(highlightRangeBox.Maximum, item.HighlightRange));
@@ -3135,8 +5133,19 @@ namespace DisplayPresetPrototype
             shadowsBox.Value = highlightsBox.Value = midtonesBox.Value = 0;
             blackPointBox.Value = whitePointBox.Value = contrastPivotBox.Value = 0;
             temperatureBox.Value = tintBox.Value = vibranceBox.Value = 0;
+            saturationBox.Value = 50;
             exposureBox.Value = shadowRangeBox.Value = highlightRangeBox.Value = transitionSoftnessBox.Value = 0;
-            status.Text = "当前没有预设，可回到主界面保存一个新的预设。";
+            status.Text = "当前没有预设；可点击“恢复内置预设”找回默认方案。";
+        }
+
+        private void RestoreBuiltInPresets()
+        {
+            int restored = store.RestoreBuiltInPresets();
+            RefreshList(store.Items.Count > 0 ? store.Items[0] : null);
+            status.ForeColor = Color.FromArgb(45, 90, 55);
+            status.Text = restored > 0
+                ? "已恢复 " + restored + " 个缺失的内置预设。"
+                : "内置预设均已存在，没有覆盖当前参数。";
         }
 
         private void SaveSelected()
@@ -3157,7 +5166,18 @@ namespace DisplayPresetPrototype
                 status.Text = "已有同名预设，请换一个名称。";
                 return;
             }
+            string previousName = item.Name;
             item.Name = name;
+            if (store.CyclePresetNames != null)
+            {
+                for (int cycleIndex = 0;
+                    cycleIndex < store.CyclePresetNames.Count; cycleIndex++)
+                {
+                    if (string.Equals(store.CyclePresetNames[cycleIndex], previousName,
+                        StringComparison.OrdinalIgnoreCase))
+                        store.CyclePresetNames[cycleIndex] = name;
+                }
+            }
             item.Shadows = (int)shadowsBox.Value;
             item.Highlights = (int)highlightsBox.Value;
             item.Midtones = (int)midtonesBox.Value;
@@ -3167,6 +5187,7 @@ namespace DisplayPresetPrototype
             item.Temperature = (int)temperatureBox.Value;
             item.Tint = (int)tintBox.Value;
             item.Vibrance = (int)vibranceBox.Value;
+            item.Saturation = (int)saturationBox.Value;
             item.Exposure = (int)exposureBox.Value;
             item.ShadowRange = (int)shadowRangeBox.Value;
             item.HighlightRange = (int)highlightRangeBox.Value;
@@ -3198,78 +5219,125 @@ namespace DisplayPresetPrototype
         public event EventHandler BindingSaved;
         private readonly StyleSettingsStore store;
         private readonly Dictionary<string, string> registrationStatus;
-        private readonly ComboBox targetBox = new ComboBox();
+        private readonly ComboBox targetBox = new ThemedComboBox();
         private readonly TextBox hotkeyInput = new TextBox();
+        private readonly TextBox cycleHotkeyInput = new TextBox();
+        private readonly CheckedListBox cyclePresetList = new CheckedListBox();
         private readonly Label status = new Label();
         private readonly ToolTip helpTip = new ToolTip();
         private bool loading;
         private int capturedKey;
         private uint capturedModifiers;
+        private int capturedCycleKey;
+        private uint capturedCycleModifiers;
 
         public HotkeySettingsForm(
             StyleSettingsStore store, Dictionary<string, string> registrationStatus)
         {
             this.store = store;
             this.registrationStatus = registrationStatus;
+            if (this.store.CyclePresetNames == null)
+                this.store.CyclePresetNames = new List<string>();
             Text = "快捷键设置";
-            ClientSize = new Size(480, 280);
+            ClientSize = new Size(560, 650);
+            MinimumSize = new Size(500, 480);
             StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true;
             MinimizeBox = false;
             Font = new Font("Microsoft YaHei UI", 9F);
             BackColor = Color.FromArgb(245, 247, 251);
+            AutoScaleDimensions = new SizeF(96F, 96F);
             AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScroll = true;
+            AutoScrollMinSize = new Size(560, 650);
 
             var title = new Label {
-                Text = "自定义后台快捷键", AutoSize = true, Location = new Point(24, 20),
+                Text = "快捷键设置", AutoSize = false, Location = new Point(28, 18),
+                Size = new Size(500, 36), TextAlign = ContentAlignment.MiddleLeft,
                 Font = new Font(Font.FontFamily, 14F, FontStyle.Bold),
                 ForeColor = Color.FromArgb(29, 36, 50)
             };
             var note = new Label {
-                Text = "先选择功能，再点击录入框并直接按下快捷键；Backspace 或 Delete 可清除。",
-                AutoSize = true, Location = new Point(26, 54),
+                Text = "单独切换与循环切换互不混用；新保存的组合键会自动替换冲突绑定。",
+                AutoSize = false, Location = new Point(30, 56), Size = new Size(500, 24),
                 ForeColor = Color.FromArgb(104, 113, 130)
             };
+            var directCard = NewHotkeyCard(24, 91, 512, 205);
+            directCard.Tag = "SurfaceCard";
+            var directTitle = NewHotkeyTitle("单独切换", 42, 105);
+            var directNote = NewHotkeyNote("为单个滤镜或恢复原画设置一键直达快捷键", 42, 136);
             targetBox.DropDownStyle = ComboBoxStyle.DropDownList;
             targetBox.FlatStyle = FlatStyle.Flat;
-            targetBox.Location = new Point(28, 94);
-            targetBox.Size = new Size(420, 28);
+            targetBox.Location = new Point(42, 170);
+            targetBox.Size = new Size(228, 30);
             foreach (var preset in store.Items) targetBox.Items.Add(new HotkeyTarget(preset));
-            targetBox.Items.Add(new HotkeyTarget(null));
+            targetBox.Items.Add(HotkeyTarget.Restore());
             targetBox.SelectedIndexChanged += delegate { LoadTarget(); };
 
-            hotkeyInput.Location = new Point(28, 141);
-            hotkeyInput.Size = new Size(420, 30);
-            hotkeyInput.ReadOnly = true;
-            hotkeyInput.ShortcutsEnabled = false;
-            hotkeyInput.TextAlign = HorizontalAlignment.Center;
-            hotkeyInput.Font = new Font(Font.FontFamily, 10F, FontStyle.Bold);
-            hotkeyInput.BackColor = Color.White;
-            hotkeyInput.ForeColor = Color.FromArgb(29, 36, 50);
+            ConfigureHotkeyInput(hotkeyInput, 282, 170, 234);
             hotkeyInput.KeyDown += CaptureHotkey;
             hotkeyInput.Enter += delegate {
                 status.ForeColor = Color.FromArgb(76, 99, 220);
                 status.Text = "现在按下需要的快捷键组合。";
             };
 
-            var save = NewDialogButton("保存此绑定", 28, 192, 130, true);
-            save.Click += delegate { SaveTarget(); };
-            var done = NewDialogButton("完成", 348, 192, 100, true);
+            var saveDirect = NewDialogButton("保存单独快捷键", 366, 226, 150, true);
+            saveDirect.Click += delegate { SaveTarget(); };
+
+            var cycleCard = NewHotkeyCard(24, 310, 512, 260);
+            cycleCard.Tag = "TintCard";
+            var cycleTitle = NewHotkeyTitle("循环切换", 42, 324);
+            var cycleNote = NewHotkeyNote("每次按键，按下方勾选顺序切换到下一个模式", 42, 355);
+            ConfigureHotkeyInput(cycleHotkeyInput, 42, 389, 474);
+            capturedCycleKey = store.CycleHotkeyKey;
+            capturedCycleModifiers = store.CycleHotkeyModifiers;
+            cycleHotkeyInput.Text = FormatHotkey(capturedCycleModifiers, capturedCycleKey);
+            cycleHotkeyInput.KeyDown += CaptureCycleHotkey;
+            cycleHotkeyInput.Enter += delegate {
+                status.ForeColor = Color.FromArgb(76, 99, 220);
+                status.Text = "现在按下循环切换使用的快捷键组合。";
+            };
+            var cycleLabel = NewHotkeyNote("参与循环的预设（至少选择两个）", 42, 430);
+            cyclePresetList.Location = new Point(42, 458);
+            cyclePresetList.Size = new Size(316, 92);
+            cyclePresetList.CheckOnClick = true;
+            cyclePresetList.BorderStyle = BorderStyle.FixedSingle;
+            foreach (var preset in store.Items)
+            {
+                int index = cyclePresetList.Items.Add(preset.Name);
+                if (store.CyclePresetNames != null && store.CyclePresetNames.Exists(
+                    name => string.Equals(name, preset.Name, StringComparison.OrdinalIgnoreCase)))
+                    cyclePresetList.SetItemChecked(index, true);
+            }
+
+            var saveCycle = NewDialogButton("保存循环设置", 370, 516, 146, true);
+            saveCycle.Click += delegate { SaveCycleTarget(); };
+            var done = NewDialogButton("完成", 416, 594, 100, true);
             done.DialogResult = DialogResult.OK;
-            status.Location = new Point(28, 238);
-            status.Size = new Size(420, 24);
+            status.Location = new Point(30, 585);
+            status.Size = new Size(370, 52);
             status.ForeColor = Color.FromArgb(45, 90, 55);
 
-            Controls.AddRange(new Control[] { title, note, targetBox, hotkeyInput, save, done, status });
+            Controls.AddRange(new Control[] {
+                title, note, directCard, cycleCard,
+                directTitle, directNote, targetBox, hotkeyInput, saveDirect,
+                cycleTitle, cycleNote, cycleHotkeyInput, cycleLabel,
+                cyclePresetList, saveCycle, done, status
+            });
+            cycleCard.SendToBack();
+            directCard.SendToBack();
             helpTip.IsBalloon = true;
             helpTip.InitialDelay = 500;
             helpTip.AutoPopDelay = 9000;
             helpTip.ShowAlways = true;
             helpTip.SetToolTip(targetBox, "选择需要绑定快捷键的画面风格或恢复操作。");
             helpTip.SetToolTip(hotkeyInput, "点击后直接按下快捷键组合；按 Backspace 或 Delete 清除。");
+            helpTip.SetToolTip(cyclePresetList,
+                "只有勾选的画面预设会加入循环；每次按快捷键切换到列表中的下一个。");
             AcceptButton = done;
             if (targetBox.Items.Count > 0) targetBox.SelectedIndex = 0;
+            SecondaryWindowTheme.Apply(this);
         }
 
         private void LoadTarget()
@@ -3277,8 +5345,14 @@ namespace DisplayPresetPrototype
             var target = targetBox.SelectedItem as HotkeyTarget;
             if (target == null) return;
             loading = true;
-            uint modifiers = target.Preset == null ? store.RestoreHotkeyModifiers : target.Preset.HotkeyModifiers;
-            int key = target.Preset == null ? store.RestoreHotkeyKey : target.Preset.HotkeyKey;
+            uint modifiers = target.Kind == HotkeyTargetKind.Restore
+                ? store.RestoreHotkeyModifiers
+                : target.Kind == HotkeyTargetKind.Cycle
+                    ? store.CycleHotkeyModifiers : target.Preset.HotkeyModifiers;
+            int key = target.Kind == HotkeyTargetKind.Restore
+                ? store.RestoreHotkeyKey
+                : target.Kind == HotkeyTargetKind.Cycle
+                    ? store.CycleHotkeyKey : target.Preset.HotkeyKey;
             capturedModifiers = modifiers;
             capturedKey = key;
             hotkeyInput.Text = FormatHotkey(capturedModifiers, capturedKey);
@@ -3290,7 +5364,8 @@ namespace DisplayPresetPrototype
         {
             var target = targetBox.SelectedItem as HotkeyTarget;
             if (target == null) return;
-            string name = target.Preset == null ? "恢复原始画面" : target.Preset.Name;
+            string name = target.Kind == HotkeyTargetKind.Restore ? "恢复原始画面" :
+                target.Kind == HotkeyTargetKind.Cycle ? "循环切换所选预设" : target.Preset.Name;
             string result;
             if (!registrationStatus.TryGetValue(name, out result))
                 result = capturedKey == 0 ? "未设置" : "等待注册";
@@ -3329,24 +5404,132 @@ namespace DisplayPresetPrototype
             status.Text = "已录入，点击“保存此绑定”后生效。";
         }
 
+        private void CaptureCycleHotkey(object sender, KeyEventArgs e)
+        {
+            e.SuppressKeyPress = true;
+            e.Handled = true;
+            if (e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete)
+            {
+                capturedCycleKey = 0;
+                capturedCycleModifiers = 0;
+                cycleHotkeyInput.Text = "未设置";
+                status.Text = "循环快捷键已清除，点击“保存循环设置”后生效。";
+                return;
+            }
+            if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.Menu ||
+                e.KeyCode == Keys.ShiftKey || e.KeyCode == Keys.LWin || e.KeyCode == Keys.RWin)
+            {
+                cycleHotkeyInput.Text = FormatPressedModifiers(e.Control, e.Alt, e.Shift);
+                return;
+            }
+            capturedCycleModifiers = (e.Alt ? 0x1u : 0u) |
+                                     (e.Control ? 0x2u : 0u) |
+                                     (e.Shift ? 0x4u : 0u);
+            capturedCycleKey = (int)e.KeyCode;
+            cycleHotkeyInput.Text = FormatHotkey(
+                capturedCycleModifiers, capturedCycleKey);
+            status.ForeColor = Color.FromArgb(45, 90, 55);
+            status.Text = "循环快捷键已录入，点击“保存循环设置”后生效。";
+        }
+
+        private void SaveCycleTarget()
+        {
+            if (capturedCycleKey != 0 && cyclePresetList.CheckedItems.Count < 2)
+            {
+                status.ForeColor = Color.FromArgb(180, 55, 55);
+                status.Text = "循环切换至少需要勾选两个预设。";
+                return;
+            }
+            var replaced = new List<string>();
+            var cycleTarget = HotkeyTarget.Cycle();
+            if (capturedCycleKey != 0)
+                ClearConflictingBindings(cycleTarget, capturedCycleModifiers,
+                    capturedCycleKey, replaced);
+            store.CycleHotkeyModifiers = capturedCycleModifiers;
+            store.CycleHotkeyKey = capturedCycleKey;
+            store.CyclePresetNames.Clear();
+            foreach (object item in cyclePresetList.CheckedItems)
+                store.CyclePresetNames.Add(item.ToString());
+            store.Save();
+            status.ForeColor = Color.FromArgb(45, 90, 55);
+            status.Text = capturedCycleKey == 0 ? "已取消循环切换快捷键。" :
+                replaced.Count == 0 ? "循环切换设置已保存。" :
+                "循环设置已保存，并自动替换：" +
+                    string.Join("、", replaced.ToArray());
+            if (BindingSaved != null) BindingSaved(this, EventArgs.Empty);
+        }
+
         private void SaveTarget()
         {
             if (loading) return;
             var target = targetBox.SelectedItem as HotkeyTarget;
             if (target == null) return;
-            if (target.Preset == null)
+            if (target.Kind == HotkeyTargetKind.Cycle && capturedKey != 0 &&
+                cyclePresetList.CheckedItems.Count < 2)
+            {
+                status.ForeColor = Color.FromArgb(180, 55, 55);
+                status.Text = "循环切换至少需要勾选两个预设。";
+                return;
+            }
+            var replaced = new List<string>();
+            if (capturedKey != 0)
+                ClearConflictingBindings(target, capturedModifiers, capturedKey, replaced);
+            if (target.Kind == HotkeyTargetKind.Restore)
             {
                 store.RestoreHotkeyModifiers = capturedModifiers;
                 store.RestoreHotkeyKey = capturedKey;
+            }
+            else if (target.Kind == HotkeyTargetKind.Cycle)
+            {
+                store.CycleHotkeyModifiers = capturedModifiers;
+                store.CycleHotkeyKey = capturedKey;
+                store.CyclePresetNames.Clear();
+                foreach (object item in cyclePresetList.CheckedItems)
+                    store.CyclePresetNames.Add(item.ToString());
             }
             else
             {
                 target.Preset.HotkeyModifiers = capturedModifiers;
                 target.Preset.HotkeyKey = capturedKey;
             }
-            status.Text = capturedKey == 0 ? "已取消该功能的快捷键。" : "绑定已更新。";
+            status.ForeColor = Color.FromArgb(45, 90, 55);
+            status.Text = capturedKey == 0 ? "已取消该功能的快捷键。" :
+                replaced.Count == 0 ? "绑定已更新。" :
+                "绑定已更新，并自动替换：" + string.Join("、", replaced.ToArray());
             store.Save();
             if (BindingSaved != null) BindingSaved(this, EventArgs.Empty);
+        }
+
+        private void ClearConflictingBindings(
+            HotkeyTarget selected, uint modifiers, int key, List<string> replaced)
+        {
+            foreach (var preset in store.Items)
+            {
+                if (selected.Kind == HotkeyTargetKind.Preset && preset == selected.Preset)
+                    continue;
+                if (preset.HotkeyKey == key && preset.HotkeyModifiers == modifiers)
+                {
+                    preset.HotkeyKey = 0;
+                    preset.HotkeyModifiers = 0;
+                    replaced.Add(preset.Name);
+                }
+            }
+            if (selected.Kind != HotkeyTargetKind.Restore &&
+                store.RestoreHotkeyKey == key &&
+                store.RestoreHotkeyModifiers == modifiers)
+            {
+                store.RestoreHotkeyKey = 0;
+                store.RestoreHotkeyModifiers = 0;
+                replaced.Add("恢复原始画面");
+            }
+            if (selected.Kind != HotkeyTargetKind.Cycle &&
+                store.CycleHotkeyKey == key &&
+                store.CycleHotkeyModifiers == modifiers)
+            {
+                store.CycleHotkeyKey = 0;
+                store.CycleHotkeyModifiers = 0;
+                replaced.Add("循环切换所选预设");
+            }
         }
 
         private static string FormatPressedModifiers(bool control, bool alt, bool shift)
@@ -3380,13 +5563,454 @@ namespace DisplayPresetPrototype
             return button;
         }
 
+        private static RoundedPanel NewHotkeyCard(
+            int x, int y, int width, int height)
+        {
+            return new RoundedPanel {
+                Location = new Point(x, y), Size = new Size(width, height),
+                FillColor = Color.White, CornerRadius = 16,
+                BackColor = Color.Transparent
+            };
+        }
+
+        private Label NewHotkeyTitle(string text, int x, int y)
+        {
+            return new Label {
+                Text = text, AutoSize = false, Location = new Point(x, y),
+                Size = new Size(450, 28), TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = Color.White, ForeColor = Color.FromArgb(29, 36, 50),
+                Font = new Font(Font.FontFamily, 11F, FontStyle.Bold)
+            };
+        }
+
+        private Label NewHotkeyNote(string text, int x, int y)
+        {
+            return new Label {
+                Text = text, AutoSize = false, Location = new Point(x, y),
+                Size = new Size(460, 24), TextAlign = ContentAlignment.MiddleLeft,
+                BackColor = Color.White, ForeColor = Color.FromArgb(104, 113, 130),
+                Font = new Font(Font.FontFamily, 8.5F)
+            };
+        }
+
+        private void ConfigureHotkeyInput(
+            TextBox input, int x, int y, int width)
+        {
+            input.Location = new Point(x, y);
+            input.Size = new Size(width, 30);
+            input.ReadOnly = true;
+            input.ShortcutsEnabled = false;
+            input.TextAlign = HorizontalAlignment.Center;
+            input.Font = new Font(Font.FontFamily, 10F, FontStyle.Bold);
+            input.BackColor = Color.FromArgb(249, 250, 253);
+            input.ForeColor = Color.FromArgb(29, 36, 50);
+            input.BorderStyle = BorderStyle.FixedSingle;
+        }
+
+        private enum HotkeyTargetKind { Preset, Restore, Cycle }
+
         private sealed class HotkeyTarget
         {
             public readonly StylePresetData Preset;
-            public HotkeyTarget(StylePresetData preset) { Preset = preset; }
-            public override string ToString() { return Preset == null ? "恢复原始画面" : Preset.Name; }
+            public readonly HotkeyTargetKind Kind;
+            public HotkeyTarget(StylePresetData preset) {
+                Preset = preset; Kind = HotkeyTargetKind.Preset;
+            }
+            private HotkeyTarget(HotkeyTargetKind kind) { Kind = kind; }
+            public static HotkeyTarget Restore() { return new HotkeyTarget(HotkeyTargetKind.Restore); }
+            public static HotkeyTarget Cycle() { return new HotkeyTarget(HotkeyTargetKind.Cycle); }
+            public override string ToString() {
+                return Kind == HotkeyTargetKind.Restore ? "恢复原始画面" :
+                    Kind == HotkeyTargetKind.Cycle ? "循环切换所选预设" : Preset.Name;
+            }
         }
 
+    }
+
+    internal sealed class ToolsCenterForm : Form
+    {
+        public event EventHandler SettingsChanged;
+        private readonly StyleSettingsStore styles;
+        private readonly AppSettingsStore settings;
+        private readonly Action captureA;
+        private readonly Action captureB;
+        private readonly Action<bool> applyTemporary;
+        private readonly Func<string> diagnose;
+        private readonly ComboBox gamePreset = new ThemedComboBox();
+        private readonly TextBox processName = new TextBox();
+        private readonly ListBox gameRules = new ListBox();
+        private readonly TextBox holdInput = new TextBox();
+        private readonly TextBox shareCode = new TextBox();
+        private readonly TextBox diagnosis = new TextBox();
+        private int holdKey;
+        private uint holdModifiers;
+
+        public ToolsCenterForm(
+            StyleSettingsStore styles, AppSettingsStore settings,
+            Action captureA, Action captureB, Action<bool> applyTemporary,
+            Func<string> diagnose, CheckBox restoreOnExitOption = null)
+        {
+            this.styles = styles; this.settings = settings;
+            this.captureA = captureA; this.captureB = captureB;
+            this.applyTemporary = applyTemporary; this.diagnose = diagnose;
+            Text = "ShadePilot 工具中心";
+            ClientSize = new Size(760, 680);
+            MinimumSize = new Size(620, 520);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.Sizable;
+            MaximizeBox = true; MinimizeBox = false;
+            Font = new Font("Microsoft YaHei UI", 9F);
+            BackColor = Color.FromArgb(245, 247, 251);
+            AutoScaleDimensions = new SizeF(96F, 96F);
+            AutoScaleMode = AutoScaleMode.Dpi;
+            AutoScroll = true;
+            AutoScrollMinSize = new Size(760, 680);
+
+            var compareCard = new RoundedPanel { Location = new Point(20, 14), Size = new Size(720, 150), Tag = "SurfaceCard" };
+            var gameCard = new RoundedPanel { Location = new Point(20, 176), Size = new Size(720, 208), Tag = "TintCard" };
+            var shareCard = new RoundedPanel { Location = new Point(20, 390), Size = new Size(720, 115), Tag = "SurfaceCard" };
+            var diagnosticCard = new RoundedPanel { Location = new Point(20, 511), Size = new Size(720, 151), Tag = "TintCard" };
+            Controls.AddRange(new Control[] { compareCard, gameCard, shareCard, diagnosticCard });
+
+            AddTitle("原画 / A-B 画面对比", 34, 22);
+            AddNote("按一次快捷键切到原画，再按一次恢复滤镜；A/B 用来保存两组临时效果并来回比较。", 34, 48);
+            AddLabel("切换原画快捷键", 34, 82);
+            ConfigureInput(holdInput, 130, 79, 220);
+            holdKey = settings.HoldOriginalKey;
+            holdModifiers = settings.HoldOriginalModifiers;
+            holdInput.Text = FormatHotkey(holdModifiers, holdKey);
+            holdInput.KeyDown += CaptureHold;
+            var saveHold = Button("保存快捷键", 362, 77, 116, true);
+            saveHold.Click += delegate {
+                settings.HoldOriginalKey = holdKey;
+                settings.HoldOriginalModifiers = holdModifiers;
+                settings.Save(); Changed();
+            };
+            var capA = Button("当前效果存为 A", 34, 124, 132, false);
+            var capB = Button("当前效果存为 B", 176, 124, 132, false);
+            var showA = Button("切换到 A", 318, 124, 100, false);
+            var showB = Button("切换到 B", 428, 124, 100, false);
+            capA.Click += delegate { captureA(); };
+            capB.Click += delegate { captureB(); };
+            showA.Click += delegate { applyTemporary(true); };
+            showB.Click += delegate { applyTemporary(false); };
+
+            AddTitle("游戏自动切换", 34, 184);
+            var enabled = new CheckBox {
+                Text = "启用前台游戏自动切换", AutoSize = false,
+                Location = new Point(34, 216), Size = new Size(250, 28),
+                Checked = settings.GameAutoSwitchEnabled
+            };
+            enabled.CheckedChanged += delegate {
+                settings.GameAutoSwitchEnabled = enabled.Checked;
+                settings.Save(); Changed();
+            };
+            var restoreAfter = new CheckBox {
+                Text = "离开游戏后恢复进入前画面", AutoSize = false,
+                Location = new Point(300, 216), Size = new Size(250, 28),
+                Checked = settings.RestoreAfterGame
+            };
+            restoreAfter.CheckedChanged += delegate {
+                settings.RestoreAfterGame = restoreAfter.Checked;
+                settings.Save(); Changed();
+            };
+            var frameGenCompatibility = new CheckBox {
+                Text = "游戏性能保护（全屏时暂停软件色彩与显示器重检）",
+                AutoSize = false, Location = new Point(34, 242), Size = new Size(390, 28),
+                Checked = settings.FrameGenerationCompatibility
+            };
+            frameGenCompatibility.CheckedChanged += delegate {
+                settings.FrameGenerationCompatibility = frameGenCompatibility.Checked;
+                settings.Save(); Changed();
+            };
+            ConfigureInput(processName, 34, 273, 210);
+            processName.ReadOnly = false;
+            processName.TextAlign = HorizontalAlignment.Left;
+            processName.Text = "EscapeFromTarkov.exe";
+            gamePreset.DropDownStyle = ComboBoxStyle.DropDownList;
+            gamePreset.FlatStyle = FlatStyle.Flat;
+            gamePreset.Location = new Point(254, 273);
+            gamePreset.Size = new Size(220, 30);
+            foreach (var style in styles.Items) gamePreset.Items.Add(style);
+            if (gamePreset.Items.Count > 0) gamePreset.SelectedIndex = 0;
+            var addRule = Button("添加规则", 486, 271, 100, true);
+            addRule.Click += delegate { AddGameRule(); };
+            gameRules.Location = new Point(34, 313);
+            gameRules.Size = new Size(552, 61);
+            gameRules.BorderStyle = BorderStyle.FixedSingle;
+            RefreshRules();
+            var deleteRule = Button("删除选中", 598, 313, 112, false);
+            deleteRule.Click += delegate {
+                var rule = gameRules.SelectedItem as GamePresetRule;
+                if (rule == null) return;
+                settings.GameRules.Remove(rule); settings.Save();
+                RefreshRules(); Changed();
+            };
+
+            AddTitle("预设分享代码", 34, 398);
+            shareCode.Location = new Point(34, 431);
+            shareCode.Size = new Size(552, 66);
+            shareCode.Multiline = true;
+            shareCode.ScrollBars = ScrollBars.Vertical;
+            shareCode.BorderStyle = BorderStyle.FixedSingle;
+            var exportCode = Button("导出当前", 598, 431, 112, false);
+            exportCode.Click += delegate {
+                var preset = styles.Items.Count == 0 ? null :
+                    styles.Items[Math.Max(0, Math.Min(styles.Items.Count - 1,
+                        gamePreset.SelectedIndex))];
+                if (preset != null) shareCode.Text = PresetCode.Export(preset);
+            };
+            var importCode = Button("导入代码", 598, 471, 112, true);
+            importCode.Click += delegate { ImportShareCode(); };
+
+            AddTitle("环境诊断中心", 34, 519);
+            diagnosis.Location = new Point(34, 552);
+            diagnosis.Size = new Size(552, 92);
+            diagnosis.Multiline = true; diagnosis.ReadOnly = true;
+            diagnosis.ScrollBars = ScrollBars.Vertical;
+            diagnosis.BorderStyle = BorderStyle.FixedSingle;
+            diagnosis.Text = diagnose();
+            var refreshDiag = Button("重新诊断", 598, 552, 112, false);
+            refreshDiag.Click += delegate { diagnosis.Text = diagnose(); };
+            var copyDiag = Button("复制结果", 598, 592, 112, false);
+            copyDiag.Click += delegate { Clipboard.SetText(diagnosis.Text); };
+            var done = Button("完成", 614, 638, 96, true);
+            done.DialogResult = DialogResult.OK;
+
+            Controls.AddRange(new Control[] {
+                holdInput, saveHold, capA, capB, showA, showB, enabled, restoreAfter,
+                frameGenCompatibility,
+                processName, gamePreset, addRule, gameRules, deleteRule,
+                shareCode, exportCode, importCode, diagnosis, refreshDiag,
+                copyDiag, done
+            });
+            if (restoreOnExitOption != null)
+            {
+                Controls.Add(restoreOnExitOption);
+                restoreOnExitOption.AutoSize = false;
+                restoreOnExitOption.Location = new Point(430, 242);
+                restoreOnExitOption.Size = new Size(180, 28);
+                restoreOnExitOption.Text = "退出时自动恢复";
+            }
+            ReparentRange(compareCard, 14, 164);
+            ReparentRange(gameCard, 176, 384);
+            ReparentRange(shareCard, 390, 505);
+            ReparentRange(diagnosticCard, 511, 662);
+            Action fitTools = delegate {
+                int cardWidth = Math.Max(580, ClientSize.Width - 40);
+                compareCard.Width = cardWidth;
+                gameCard.Width = cardWidth;
+                shareCard.Width = cardWidth;
+                diagnosticCard.Width = cardWidth;
+                int actionX = cardWidth - 142;
+                deleteRule.Left = actionX;
+                exportCode.Left = actionX;
+                importCode.Left = actionX;
+                refreshDiag.Left = actionX;
+                copyDiag.Left = actionX;
+                done.Left = cardWidth - 126;
+                gameRules.Width = Math.Max(360, cardWidth - 168);
+                shareCode.Width = Math.Max(360, cardWidth - 168);
+                diagnosis.Width = Math.Max(360, cardWidth - 168);
+            };
+            SizeChanged += delegate { fitTools(); };
+            fitTools();
+            diagnosticCard.SendToBack();
+            shareCard.SendToBack();
+            gameCard.SendToBack();
+            compareCard.SendToBack();
+            SecondaryWindowTheme.Apply(this);
+            AcceptButton = done;
+        }
+
+        private void ReparentRange(RoundedPanel card, int top, int bottom)
+        {
+            var moving = new List<Control>();
+            foreach (Control control in Controls)
+            {
+                if (control == card || control is RoundedPanel) continue;
+                int center = control.Top + control.Height / 2;
+                if (center >= top && center <= bottom) moving.Add(control);
+            }
+            foreach (Control control in moving)
+            {
+                control.Location = new Point(control.Left - card.Left, control.Top - card.Top);
+                card.Controls.Add(control);
+                if (control is Label || control is CheckBox)
+                    control.BackColor = Color.Transparent;
+                var button = control as RoundedButton;
+                if (button != null) button.SurfaceColor = card.FillColor;
+            }
+        }
+
+        public void ConfigureEmbedded()
+        {
+            TopLevel = false;
+            FormBorderStyle = FormBorderStyle.None;
+            Dock = DockStyle.Fill;
+            MinimumSize = Size.Empty;
+            AutoScroll = false;
+            AutoScrollMinSize = Size.Empty;
+            AcceptButton = null;
+            HideCompletionButton(Controls);
+        }
+
+        private static void HideCompletionButton(Control.ControlCollection controls)
+        {
+            foreach (Control control in controls)
+            {
+                var button = control as Button;
+                if (button != null && button.Text == "完成") button.Visible = false;
+                if (control.HasChildren) HideCompletionButton(control.Controls);
+            }
+        }
+
+        private void CaptureHold(object sender, KeyEventArgs e)
+        {
+            e.SuppressKeyPress = true; e.Handled = true;
+            if (e.KeyCode == Keys.Back || e.KeyCode == Keys.Delete)
+            { holdKey = 0; holdModifiers = 0; holdInput.Text = "未设置"; return; }
+            if (e.KeyCode == Keys.ControlKey || e.KeyCode == Keys.Menu ||
+                e.KeyCode == Keys.ShiftKey) return;
+            holdModifiers = (e.Alt ? 1u : 0u) | (e.Control ? 2u : 0u) |
+                (e.Shift ? 4u : 0u);
+            holdKey = (int)e.KeyCode;
+            holdInput.Text = FormatHotkey(holdModifiers, holdKey);
+        }
+
+        private void AddGameRule()
+        {
+            var preset = gamePreset.SelectedItem as StylePresetData;
+            string process = processName.Text.Trim();
+            if (preset == null || process.Length == 0) return;
+            var existing = settings.GameRules.Find(item =>
+                string.Equals(item.ProcessName, process, StringComparison.OrdinalIgnoreCase));
+            if (existing == null) {
+                existing = new GamePresetRule { ProcessName = process };
+                settings.GameRules.Add(existing);
+            }
+            existing.PresetName = preset.Name;
+            settings.Save(); RefreshRules(); Changed();
+        }
+
+        private void RefreshRules()
+        {
+            gameRules.Items.Clear();
+            foreach (var rule in settings.GameRules) gameRules.Items.Add(rule);
+        }
+
+        private void ImportShareCode()
+        {
+            try
+            {
+                var preset = PresetCode.Import(shareCode.Text.Trim());
+                string baseName = preset.Name;
+                int suffix = 2;
+                while (styles.Items.Exists(item => string.Equals(
+                    item.Name, preset.Name, StringComparison.OrdinalIgnoreCase)))
+                    preset.Name = baseName + " (" + suffix++ + ")";
+                styles.Items.Add(preset); styles.Save(); Changed();
+                MessageBox.Show(this, "已导入预设：" + preset.Name,
+                    "分享代码", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "导入失败：" + ex.Message,
+                    "分享代码", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+
+        private void Changed() {
+            if (SettingsChanged != null) SettingsChanged(this, EventArgs.Empty);
+        }
+        private void AddTitle(string text, int x, int y) { Controls.Add(new Label {
+            Text=text, AutoSize=false, Location=new Point(x,y), Size=new Size(500,28),
+            Font=new Font(Font.FontFamily,11F,FontStyle.Bold),
+            ForeColor=Color.FromArgb(29,36,50), TextAlign=ContentAlignment.MiddleLeft }); }
+        private void AddNote(string text, int x, int y) { Controls.Add(new Label {
+            Text=text, AutoSize=false, Location=new Point(x,y), Size=new Size(650,24),
+            ForeColor=Color.FromArgb(104,113,130), TextAlign=ContentAlignment.MiddleLeft }); }
+        private void AddLabel(string text, int x, int y) { Controls.Add(new Label {
+            Text=text, AutoSize=false, Location=new Point(x,y), Size=new Size(90,28),
+            ForeColor=Color.FromArgb(47,55,70), TextAlign=ContentAlignment.MiddleLeft }); }
+        private void ConfigureInput(TextBox input,int x,int y,int width) {
+            input.Location=new Point(x,y); input.Size=new Size(width,30);
+            input.ReadOnly=true; input.TextAlign=HorizontalAlignment.Center;
+            input.BorderStyle=BorderStyle.FixedSingle; input.BackColor=Color.White; }
+        private Button Button(string text,int x,int y,int width,bool primary) {
+            return new RoundedButton { Text=text,Location=new Point(x,y),Size=new Size(width,34),
+                BackColor=primary?Color.FromArgb(76,99,220):Color.FromArgb(238,241,247),
+                ForeColor=primary?Color.White:Color.FromArgb(29,36,50),
+                SurfaceColor=BackColor,Cursor=Cursors.Hand }; }
+        private static string FormatHotkey(uint modifiers,int key) {
+            if(key==0)return "未设置"; string t="";
+            if((modifiers&2)!=0)t+="Ctrl + "; if((modifiers&1)!=0)t+="Alt + ";
+            if((modifiers&4)!=0)t+="Shift + "; return t+((Keys)key); }
+    }
+
+    internal static class PresetCode
+    {
+        private const string Prefix = "SP3-";
+        public static string Export(StylePresetData p)
+        {
+            string payload = string.Join("|", new string[] {
+                p.Name ?? "预设", p.Shadows.ToString(), p.Highlights.ToString(),
+                p.Midtones.ToString(), p.BlackPoint.ToString(), p.WhitePoint.ToString(),
+                p.ContrastPivot.ToString(), p.Temperature.ToString(), p.Tint.ToString(),
+                p.Vibrance.ToString(), p.Exposure.ToString(), p.ShadowRange.ToString(),
+                p.HighlightRange.ToString(), p.TransitionSoftness.ToString(),
+                (p.Saturation <= 0 ? 50 : p.Saturation).ToString() });
+            byte[] data = Encoding.UTF8.GetBytes(payload);
+            string body = Convert.ToBase64String(data).TrimEnd('=').Replace('+','-').Replace('/','_');
+            return Prefix + body + "-" + Checksum(data).ToString("X8");
+        }
+        public static StylePresetData Import(string code)
+        {
+            if (string.IsNullOrWhiteSpace(code) ||
+                !(code.StartsWith(Prefix) || code.StartsWith("SP2-") || code.StartsWith("SP1-")))
+                throw new InvalidOperationException("不是 ShadePilot 分享代码。");
+            string codePrefix = code.StartsWith(Prefix) ? Prefix :
+                (code.StartsWith("SP2-") ? "SP2-" : "SP1-");
+            int split = code.LastIndexOf('-');
+            if (split <= Prefix.Length) throw new InvalidOperationException("代码不完整。");
+            string body = code.Substring(codePrefix.Length, split-codePrefix.Length)
+                .Replace('-','+').Replace('_','/');
+            while (body.Length % 4 != 0) body += "=";
+            byte[] data = Convert.FromBase64String(body);
+            uint expected;
+            if (!uint.TryParse(code.Substring(split+1),
+                System.Globalization.NumberStyles.HexNumber, null, out expected) ||
+                expected != Checksum(data))
+                throw new InvalidOperationException("校验失败，代码可能复制不完整。");
+            string[] v = Encoding.UTF8.GetString(data).Split('|');
+            if (v.Length != 14 && v.Length != 15) throw new InvalidOperationException("参数数量不正确。");
+            var preset = new StylePresetData { Name=v[0], Shadows=I(v[1]),Highlights=I(v[2]),
+                Midtones=I(v[3]),BlackPoint=I(v[4]),WhitePoint=I(v[5]),
+                ContrastPivot=I(v[6]),Temperature=I(v[7]),Tint=I(v[8]),
+                Vibrance=I(v[9]),Exposure=I(v[10]),ShadowRange=I(v[11]),
+                HighlightRange=I(v[12]),TransitionSoftness=I(v[13]),
+                Saturation=v.Length == 15 ? I(v[14]) : 50 };
+            if (codePrefix == "SP2-")
+                preset.Saturation = (int)Math.Round(preset.Saturation / 2.0);
+            if (string.IsNullOrWhiteSpace(preset.Name) || preset.Name.Length > 80 ||
+                preset.Shadows < 0 || preset.Shadows > 200 ||
+                preset.Highlights < 0 || preset.Highlights > 200 ||
+                !Signed(preset.Midtones) || !Signed(preset.BlackPoint) ||
+                !Signed(preset.WhitePoint) || !Signed(preset.ContrastPivot) ||
+                !Signed(preset.Temperature) || !Signed(preset.Tint) ||
+                !Signed(preset.Vibrance) || !Signed(preset.Exposure) ||
+                !Signed(preset.ShadowRange) || !Signed(preset.HighlightRange) ||
+                !Signed(preset.TransitionSoftness) ||
+                preset.Saturation < 0 || preset.Saturation > 100)
+                throw new InvalidOperationException("分享代码包含超出允许范围的参数。");
+            preset.Name = preset.Name.Trim();
+            return preset;
+        }
+        private static bool Signed(int value) { return value >= -100 && value <= 100; }
+        private static int I(string value) { int result; if(!int.TryParse(value,out result))
+            throw new InvalidOperationException("代码中包含无效参数。"); return result; }
+        private static uint Checksum(byte[] data) { uint hash=2166136261;
+            foreach(byte b in data){hash^=b;hash*=16777619;} return hash; }
     }
 
     internal static class Prompt
@@ -3486,10 +6110,45 @@ namespace DisplayPresetPrototype
 
         [DllImport("user32.dll")]
         internal static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, MonitorEnumProc callback, IntPtr data);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        internal static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFOEX info);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        internal static extern bool EnumDisplayDevices(
+            string device, uint deviceNumber, ref DISPLAY_DEVICE displayDevice, uint flags);
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool RegisterHotKey(IntPtr window, int id, uint modifiers, uint virtualKey);
         [DllImport("user32.dll", SetLastError = true)]
         internal static extern bool UnregisterHotKey(IntPtr window, int id);
+        [DllImport("user32.dll")]
+        internal static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool GetWindowRect(IntPtr window, out RECT rect);
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsWindowVisible(IntPtr window);
+        [DllImport("user32.dll")]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool IsIconic(IntPtr window);
+        [DllImport("user32.dll")]
+        internal static extern uint GetWindowThreadProcessId(
+            IntPtr window, out uint processId);
+
+        internal static bool IsFullscreenWindow(IntPtr window)
+        {
+            if (window == IntPtr.Zero || !IsWindowVisible(window) || IsIconic(window))
+                return false;
+            RECT rect;
+            if (!GetWindowRect(window, out rect)) return false;
+            Rectangle bounds;
+            try { bounds = Screen.FromHandle(window).Bounds; }
+            catch { return false; }
+            const int tolerance = 4;
+            return Math.Abs(rect.Left - bounds.Left) <= tolerance &&
+                Math.Abs(rect.Top - bounds.Top) <= tolerance &&
+                Math.Abs(rect.Right - bounds.Right) <= tolerance &&
+                Math.Abs(rect.Bottom - bounds.Bottom) <= tolerance;
+        }
         [DllImport("dxva2.dll", SetLastError = true)]
         internal static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(IntPtr hMonitor, out uint count);
         [DllImport("dxva2.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -3516,12 +6175,30 @@ namespace DisplayPresetPrototype
         [DllImport("dxva2.dll", SetLastError = true)]
         internal static extern bool SetVCPFeature(IntPtr monitor, byte vcpCode, uint newValue);
 
+        internal static bool IsAdvancedColorEnabled()
+        {
+            try
+            {
+                using (var key = Registry.CurrentUser.OpenSubKey(
+                    @"Software\Microsoft\Windows\CurrentVersion\VideoSettings"))
+                    return key != null && Convert.ToInt32(
+                        key.GetValue("EnableHDRForPlayback", 0)) != 0;
+            }
+            catch { return false; }
+        }
+
         public static List<PhysicalDisplay> Enumerate()
         {
             var result = new List<PhysicalDisplay>();
             int logicalIndex = 0;
             MonitorEnumProc callback = delegate(IntPtr hMonitor, IntPtr hdc, ref RECT rect, IntPtr data)
             {
+                var monitorInfo = new MONITORINFOEX();
+                monitorInfo.cbSize = Marshal.SizeOf(typeof(MONITORINFOEX));
+                string displayDeviceName = GetMonitorInfo(hMonitor, ref monitorInfo)
+                    ? monitorInfo.szDevice : null;
+                string displayAdapterName = GetDisplayAdapterName(displayDeviceName);
+                string stableDisplayKey = GetDisplayStableKey(displayDeviceName);
                 uint count;
                 if (!GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor, out count) || count == 0) return true;
                 var physical = new PHYSICAL_MONITOR[count];
@@ -3533,7 +6210,9 @@ namespace DisplayPresetPrototype
                     result.Add(new PhysicalDisplay {
                         Handle = physical[i].hPhysicalMonitor,
                         Name = name,
-                        Id = name + "|" + rect.Left + "," + rect.Top + "|" + logicalIndex + ":" + i
+                        DisplayDeviceName = displayDeviceName,
+                        DisplayAdapterName = displayAdapterName,
+                        Id = stableDisplayKey + "|physical:" + i
                     });
                 }
                 logicalIndex++;
@@ -3542,6 +6221,62 @@ namespace DisplayPresetPrototype
             if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero, callback, IntPtr.Zero))
                 throw Error("枚举显示器");
             return result;
+        }
+
+        private static string GetDisplayAdapterName(string displayDeviceName)
+        {
+            if (string.IsNullOrWhiteSpace(displayDeviceName)) return null;
+            for (uint i = 0; i < 32; i++)
+            {
+                var adapter = new DISPLAY_DEVICE();
+                adapter.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                if (!EnumDisplayDevices(null, i, ref adapter, 0)) break;
+                if (string.Equals(adapter.DeviceName, displayDeviceName,
+                    StringComparison.OrdinalIgnoreCase))
+                    return adapter.DeviceString;
+            }
+            return null;
+        }
+
+        private static string GetDisplayStableKey(string displayDeviceName)
+        {
+            if (!string.IsNullOrWhiteSpace(displayDeviceName))
+            {
+                var monitor = new DISPLAY_DEVICE();
+                monitor.cb = Marshal.SizeOf(typeof(DISPLAY_DEVICE));
+                const uint EddGetDeviceInterfaceName = 0x00000001;
+                if (EnumDisplayDevices(displayDeviceName, 0, ref monitor,
+                    EddGetDeviceInterfaceName) && !string.IsNullOrWhiteSpace(monitor.DeviceID))
+                    return monitor.DeviceID;
+            }
+            return string.IsNullOrWhiteSpace(displayDeviceName)
+                ? "desktop-monitor" : displayDeviceName;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct DISPLAY_DEVICE
+        {
+            public int cb;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string DeviceName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceString;
+            public uint StateFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceID;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 128)]
+            public string DeviceKey;
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        internal struct MONITORINFOEX
+        {
+            public int cbSize;
+            public RECT rcMonitor;
+            public RECT rcWork;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)]
+            public string szDevice;
         }
 
         public static Exception Error(string operation)

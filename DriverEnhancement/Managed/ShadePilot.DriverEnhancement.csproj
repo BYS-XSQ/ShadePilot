@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <!-- Archived Intel Display Sharpness research is not part of the shipping provider assembly. -->
+    <Compile Remove="DriverEnhancementModels.cs" />
+    <Compile Remove="IntelSharpnessReadProvider.cs" />
+    <Compile Remove="IntelSharpnessControlProvider.cs" />
+    <Compile Remove="ReadTest\**" />
+    <None Remove="ReadTest\**" />
+    <Compile Remove="WriteGuardTest\**" />
+    <None Remove="WriteGuardTest\**" />
+  </ItemGroup>
+</Project>
